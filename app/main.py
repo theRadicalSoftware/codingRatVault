@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import secrets
 import sys
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer
@@ -9,6 +12,8 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QComboBox,
+    QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
@@ -21,6 +26,7 @@ from PyQt5.QtWidgets import (
     QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +43,37 @@ CHARCOAL = "#101217"
 GRAPHITE = "#1b1e24"
 MUTED = "#9da1ad"
 TEXT = "#f1f3f8"
+
+
+@dataclass
+class CredentialEntry:
+    service: str
+    account: str
+    username: str
+    password: str
+    url: str
+    folder: str
+    entry_type: str
+    notes: str
+    health: str = "Strong"
+    updated: str = "Today"
+    favorite: bool = False
+
+    @property
+    def masked_password(self) -> str:
+        return "*" * max(10, min(len(self.password), 18))
+
+    def searchable_text(self) -> str:
+        return " ".join([
+            self.service,
+            self.account,
+            self.username,
+            self.url,
+            self.folder,
+            self.entry_type,
+            self.notes,
+            self.health,
+        ]).lower()
 
 
 def project_root() -> Path:
@@ -183,15 +220,19 @@ class StatCard(QFrame):
 
         label_widget = QLabel(label.upper())
         label_widget.setObjectName("statLabel")
-        value_widget = QLabel(value)
-        value_widget.setObjectName("statValue")
-        detail_widget = QLabel(detail)
-        detail_widget.setObjectName("statDetail")
-        detail_widget.setWordWrap(True)
+        self.value_widget = QLabel(value)
+        self.value_widget.setObjectName("statValue")
+        self.detail_widget = QLabel(detail)
+        self.detail_widget.setObjectName("statDetail")
+        self.detail_widget.setWordWrap(True)
 
         layout.addWidget(label_widget)
-        layout.addWidget(value_widget)
-        layout.addWidget(detail_widget)
+        layout.addWidget(self.value_widget)
+        layout.addWidget(self.detail_widget)
+
+    def update_values(self, value: str, detail: str) -> None:
+        self.value_widget.setText(value)
+        self.detail_widget.setText(detail)
 
 
 class SectionPanel(QFrame):
@@ -226,8 +267,11 @@ class DashboardWidget(QWidget):
     def __init__(self, on_lock):
         super().__init__()
         self.on_lock = on_lock
-        self.nav_buttons: list[NavButton] = []
+        self.credentials = self.seed_credentials()
+        self.nav_buttons: dict[str, NavButton] = {}
+        self.visible_credentials: list[CredentialEntry] = []
         self.build_ui()
+        self.refresh_all()
 
     def build_ui(self) -> None:
         root = QHBoxLayout(self)
@@ -235,7 +279,58 @@ class DashboardWidget(QWidget):
         root.setSpacing(18)
 
         root.addWidget(self.build_sidebar())
-        root.addLayout(self.build_main_area(), 1)
+
+        self.content_host = QWidget()
+        self.content_stack = QStackedLayout(self.content_host)
+        self.content_stack.setContentsMargins(0, 0, 0, 0)
+        self.overview_view = self.build_overview_view()
+        self.vault_view = self.build_vault_view()
+        self.add_entry_view = self.build_add_entry_view()
+        self.content_stack.addWidget(self.overview_view)
+        self.content_stack.addWidget(self.vault_view)
+        self.content_stack.addWidget(self.add_entry_view)
+        root.addWidget(self.content_host, 1)
+
+    def seed_credentials(self) -> list[CredentialEntry]:
+        return [
+            CredentialEntry(
+                service="GitHub Workspace",
+                account="theRadicalSoftware",
+                username="rat@vault.local",
+                password="demo-github-token-2026",
+                url="https://github.com/theRadicalSoftware",
+                folder="Development",
+                entry_type="Login",
+                notes="Public demo credential for the UI prototype.",
+                health="Strong",
+                updated="Today",
+                favorite=True,
+            ),
+            CredentialEntry(
+                service="Deploy Console",
+                account="Rat Mode Sandbox",
+                username="deploy@rat.local",
+                password="sandbox-deploy-pass-2026",
+                url="https://deploy.example.local",
+                folder="Infrastructure",
+                entry_type="Server",
+                notes="Demo server record. No production system is connected.",
+                health="Strong",
+                updated="Today",
+            ),
+            CredentialEntry(
+                service="Design Vault",
+                account="Brand Assets",
+                username="design@rat.local",
+                password="brand-demo-pass",
+                url="https://assets.example.local",
+                folder="Creative",
+                entry_type="Secure Note",
+                notes="Placeholder for brand asset access details.",
+                health="Good",
+                updated="Yesterday",
+            ),
+        ]
 
     def build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -268,8 +363,8 @@ class DashboardWidget(QWidget):
 
         for index, label in enumerate(["Overview", "Vault", "Generator", "Security", "Settings"]):
             button = NavButton(label)
-            button.clicked.connect(lambda _checked=False, b=button: self.activate_nav(b))
-            self.nav_buttons.append(button)
+            button.clicked.connect(lambda _checked=False, name=label: self.handle_nav(name))
+            self.nav_buttons[label] = button
             layout.addWidget(button)
             if index == 0:
                 button.setChecked(True)
@@ -301,8 +396,9 @@ class DashboardWidget(QWidget):
 
         return sidebar
 
-    def build_main_area(self) -> QVBoxLayout:
-        main = QVBoxLayout()
+    def build_overview_view(self) -> QWidget:
+        view = QWidget()
+        main = QVBoxLayout(view)
         main.setContentsMargins(0, 0, 0, 0)
         main.setSpacing(16)
 
@@ -322,28 +418,28 @@ class DashboardWidget(QWidget):
         title_stack.addWidget(subtitle)
         header.addLayout(title_stack, 1)
 
-        self.search_input = QLineEdit()
-        self.search_input.setObjectName("dashboardSearch")
-        self.search_input.setPlaceholderText("Search vault")
-        self.search_input.setFixedWidth(260)
-        header.addWidget(self.search_input)
+        self.global_search_input = QLineEdit()
+        self.global_search_input.setObjectName("dashboardSearch")
+        self.global_search_input.setPlaceholderText("Search vault")
+        self.global_search_input.setFixedWidth(260)
+        self.global_search_input.returnPressed.connect(self.search_from_overview)
+        header.addWidget(self.global_search_input)
 
         add_button = QPushButton("Add Entry")
         add_button.setObjectName("primarySmallButton")
         add_button.setCursor(Qt.PointingHandCursor)
-        add_button.clicked.connect(lambda: self.set_session_message("Entry editor comes next."))
+        add_button.clicked.connect(self.show_add_entry)
         header.addWidget(add_button)
         main.addLayout(header)
 
         stats = QGridLayout()
         stats.setHorizontalSpacing(12)
         stats.setVerticalSpacing(12)
-        cards = [
-            StatCard("Entries", "0", "Ready for the first credential"),
-            StatCard("Folders", "0", "Folders will map to vault lanes"),
-            StatCard("Security", "Ready", "Baseline checks are staged"),
-            StatCard("Storage", "Local", "SQLite vault core pending"),
-        ]
+        self.entries_stat = StatCard("Entries", "0", "Ready for the first credential")
+        self.folders_stat = StatCard("Folders", "0", "Folders will map to vault lanes")
+        self.security_stat = StatCard("Security", "Ready", "Baseline checks are staged")
+        self.storage_stat = StatCard("Storage", "Local", "Session memory only")
+        cards = [self.entries_stat, self.folders_stat, self.security_stat, self.storage_stat]
         for index, card in enumerate(cards):
             stats.addWidget(card, 0, index)
         main.addLayout(stats)
@@ -364,14 +460,14 @@ class DashboardWidget(QWidget):
         self.session_status.setObjectName("dashboardStatus")
         main.addWidget(self.session_status)
 
-        return main
+        return view
 
     def build_vault_panel(self) -> QWidget:
-        panel = SectionPanel("Vault", "Recent credentials will appear here after the encrypted store is connected.")
+        panel = SectionPanel("Vault", "Recent credentials from this unlocked session.")
 
         tools = QHBoxLayout()
         tools.setSpacing(8)
-        for label in ["All", "Favorites", "Weak", "Shared"]:
+        for label in ["All", "Favorites", "Logins", "Servers"]:
             button = QPushButton(label)
             button.setObjectName("chipButton")
             button.setCheckable(True)
@@ -382,21 +478,9 @@ class DashboardWidget(QWidget):
         tools.addStretch(1)
         panel.layout.addLayout(tools)
 
-        table = QTableWidget(1, 5)
-        table.setObjectName("vaultTable")
-        table.setHorizontalHeaderLabels(["Service", "Account", "Folder", "Health", "Updated"])
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setShowGrid(False)
-        table.setMinimumHeight(278)
-        table.setSpan(0, 0, 1, 5)
-        item = QTableWidgetItem("No entries yet. Add your first credential when vault storage is connected.")
-        item.setTextAlignment(Qt.AlignCenter)
-        table.setItem(0, 0, item)
-        panel.layout.addWidget(table, 1)
+        self.overview_table = self.create_credentials_table()
+        self.overview_table.setMinimumHeight(278)
+        panel.layout.addWidget(self.overview_table, 1)
         return panel
 
     def build_actions_panel(self) -> QWidget:
@@ -414,7 +498,12 @@ class DashboardWidget(QWidget):
             button = QPushButton(f"{label}\n{detail}")
             button.setObjectName("actionButton")
             button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, text=label: self.set_session_message(f"{text} flow comes next."))
+            if label == "New Login":
+                button.clicked.connect(self.show_add_entry)
+            elif label == "Audit":
+                button.clicked.connect(lambda: self.set_session_message("Audit will inspect stored entries once persistence is connected."))
+            else:
+                button.clicked.connect(lambda _checked=False, text=label: self.set_session_message(f"{text} flow comes next."))
             grid.addWidget(button, index // 2, index % 2)
         panel.layout.addLayout(grid)
         return panel
@@ -455,10 +544,399 @@ class DashboardWidget(QWidget):
             panel.layout.addWidget(label)
         return panel
 
-    def activate_nav(self, active: NavButton) -> None:
-        for button in self.nav_buttons:
-            button.setChecked(button is active)
-        self.set_session_message(f"{active.text()} view selected.")
+    def build_vault_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("CREDENTIALS")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Vault")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Browse, filter, inspect, and copy credentials from the current unlocked session.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+
+        self.vault_search_input = QLineEdit()
+        self.vault_search_input.setObjectName("dashboardSearch")
+        self.vault_search_input.setPlaceholderText("Search credentials")
+        self.vault_search_input.setFixedWidth(300)
+        self.vault_search_input.textChanged.connect(self.refresh_vault_tables)
+        header.addWidget(self.vault_search_input)
+
+        add_button = QPushButton("Add Credential")
+        add_button.setObjectName("primarySmallButton")
+        add_button.setCursor(Qt.PointingHandCursor)
+        add_button.clicked.connect(self.show_add_entry)
+        header.addWidget(add_button)
+        layout.addLayout(header)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        for label in ["All", "Favorites", "Development", "Infrastructure", "Creative"]:
+            button = QPushButton(label)
+            button.setObjectName("chipButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            if label == "All":
+                button.setChecked(True)
+            filter_row.addWidget(button)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        self.vault_table = self.create_credentials_table()
+        self.vault_table.setMinimumHeight(430)
+        self.vault_table.itemSelectionChanged.connect(self.on_vault_selection_changed)
+        body.addWidget(self.vault_table, 3)
+
+        details = SectionPanel("Credential Detail", "Select a credential to inspect the stored account surface.")
+        self.detail_service = QLabel("No credential selected")
+        self.detail_service.setObjectName("detailTitle")
+        self.detail_account = QLabel("Choose a row in the table.")
+        self.detail_account.setObjectName("detailSubtle")
+        self.detail_url = QLabel("")
+        self.detail_url.setObjectName("detailLine")
+        self.detail_username = QLabel("")
+        self.detail_username.setObjectName("detailLine")
+        self.detail_password = QLabel("")
+        self.detail_password.setObjectName("detailLine")
+        self.detail_notes = QLabel("")
+        self.detail_notes.setObjectName("detailNote")
+        self.detail_notes.setWordWrap(True)
+
+        details.layout.addWidget(self.detail_service)
+        details.layout.addWidget(self.detail_account)
+        details.layout.addWidget(self.detail_url)
+        details.layout.addWidget(self.detail_username)
+        details.layout.addWidget(self.detail_password)
+        details.layout.addWidget(self.detail_notes)
+
+        copy_row = QHBoxLayout()
+        copy_user = QPushButton("Copy User")
+        copy_user.setObjectName("secondaryButton")
+        copy_user.setCursor(Qt.PointingHandCursor)
+        copy_user.clicked.connect(lambda: self.copy_selected_value("username"))
+        copy_pass = QPushButton("Copy Pass")
+        copy_pass.setObjectName("secondaryButton")
+        copy_pass.setCursor(Qt.PointingHandCursor)
+        copy_pass.clicked.connect(lambda: self.copy_selected_value("password"))
+        copy_row.addWidget(copy_user)
+        copy_row.addWidget(copy_pass)
+        details.layout.addLayout(copy_row)
+        body.addWidget(details, 2)
+
+        layout.addLayout(body, 1)
+        return view
+
+    def build_add_entry_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("NEW CREDENTIAL")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Add Entry")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Capture the account details now; encryption and persistence will attach in the next backend slice.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+
+        cancel_button = QPushButton("Back to Vault")
+        cancel_button.setObjectName("secondaryButton")
+        cancel_button.setCursor(Qt.PointingHandCursor)
+        cancel_button.clicked.connect(self.show_vault)
+        header.addWidget(cancel_button)
+        layout.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        form_panel = SectionPanel("Credential Form", "Required fields are service, account, and password.")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setFormAlignment(Qt.AlignTop)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+
+        self.service_field = QLineEdit()
+        self.service_field.setObjectName("formField")
+        self.service_field.setPlaceholderText("GitHub, Stripe, VPN, Database")
+        self.account_field = QLineEdit()
+        self.account_field.setObjectName("formField")
+        self.account_field.setPlaceholderText("Workspace or account label")
+        self.username_field = QLineEdit()
+        self.username_field.setObjectName("formField")
+        self.username_field.setPlaceholderText("Username or email")
+        self.entry_password_field = QLineEdit()
+        self.entry_password_field.setObjectName("formField")
+        self.entry_password_field.setEchoMode(QLineEdit.Password)
+        self.entry_password_field.setPlaceholderText("Password, token, or secret")
+        self.url_field = QLineEdit()
+        self.url_field.setObjectName("formField")
+        self.url_field.setPlaceholderText("https://")
+        self.folder_combo = QComboBox()
+        self.folder_combo.setObjectName("comboField")
+        self.folder_combo.addItems(["Development", "Infrastructure", "Creative", "Personal", "Finance"])
+        self.type_combo = QComboBox()
+        self.type_combo.setObjectName("comboField")
+        self.type_combo.addItems(["Login", "API Key", "Server", "Database", "Secure Note"])
+        self.notes_field = QTextEdit()
+        self.notes_field.setObjectName("notesField")
+        self.notes_field.setPlaceholderText("Short context, recovery notes, or rotation details")
+        self.notes_field.setFixedHeight(66)
+
+        form.addRow("Service", self.service_field)
+        form.addRow("Account", self.account_field)
+        form.addRow("Username", self.username_field)
+        form.addRow("Password", self.entry_password_field)
+        form.addRow("URL", self.url_field)
+        form.addRow("Folder", self.folder_combo)
+        form.addRow("Type", self.type_combo)
+        form.addRow("Notes", self.notes_field)
+        form_panel.layout.addLayout(form)
+
+        action_row = QHBoxLayout()
+        generate_button = QPushButton("Generate")
+        generate_button.setObjectName("secondaryButton")
+        generate_button.setCursor(Qt.PointingHandCursor)
+        generate_button.clicked.connect(self.generate_entry_password)
+        save_button = QPushButton("Save Entry")
+        save_button.setObjectName("primarySmallButton")
+        save_button.setCursor(Qt.PointingHandCursor)
+        save_button.clicked.connect(self.save_entry)
+        action_row.addWidget(generate_button)
+        action_row.addStretch(1)
+        action_row.addWidget(save_button)
+        form_panel.layout.addLayout(action_row)
+        body.addWidget(form_panel, 3)
+
+        guidance = SectionPanel("Entry Guidance")
+        for text in [
+            "Use names that are easy to scan later.",
+            "Keep recovery hints in notes, not full recovery codes.",
+            "Folder and type choices will become real filters in the persistent vault.",
+            "This prototype stores entries in memory for the current session only.",
+        ]:
+            label = QLabel(text)
+            label.setObjectName("activityLine")
+            label.setWordWrap(True)
+            guidance.layout.addWidget(label)
+        guidance.layout.addStretch(1)
+        body.addWidget(guidance, 2)
+        layout.addLayout(body, 1)
+        return view
+
+    def create_credentials_table(self) -> QTableWidget:
+        table = QTableWidget(0, 4)
+        table.setObjectName("vaultTable")
+        table.setHorizontalHeaderLabels(["Service", "Account", "Folder", "Health"])
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(44)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(True)
+        return table
+
+    def handle_nav(self, name: str) -> None:
+        if name == "Overview":
+            self.show_overview()
+        elif name == "Vault":
+            self.show_vault()
+        else:
+            self.activate_nav(name)
+            self.set_session_message(f"{name} workspace is planned for the next product slice.")
+
+    def activate_nav(self, name: str) -> None:
+        for label, button in self.nav_buttons.items():
+            button.setChecked(label == name)
+
+    def show_overview(self) -> None:
+        self.activate_nav("Overview")
+        self.content_stack.setCurrentWidget(self.overview_view)
+        self.set_session_message("Command center ready.")
+
+    def show_vault(self) -> None:
+        self.activate_nav("Vault")
+        self.content_stack.setCurrentWidget(self.vault_view)
+        self.refresh_vault_tables()
+        self.set_session_message("Vault view ready.")
+
+    def show_add_entry(self) -> None:
+        self.activate_nav("Vault")
+        self.content_stack.setCurrentWidget(self.add_entry_view)
+        self.service_field.setFocus()
+        self.set_session_message("Add a new credential.")
+
+    def search_from_overview(self) -> None:
+        query = self.global_search_input.text().strip()
+        self.vault_search_input.setText(query)
+        self.show_vault()
+
+    def refresh_all(self) -> None:
+        folders = sorted({entry.folder for entry in self.credentials})
+        weak_count = len([entry for entry in self.credentials if entry.health == "Weak"])
+        self.entries_stat.update_values(str(len(self.credentials)), "Stored in this demo session")
+        self.folders_stat.update_values(str(len(folders)), "Active folder lanes")
+        self.security_stat.update_values("Ready" if weak_count == 0 else "Review", f"{weak_count} weak entries")
+        self.storage_stat.update_values("Memory", "Persistence comes next")
+        self.populate_table(self.overview_table, self.credentials[:5], empty_text="No entries yet. Add your first credential.")
+        self.refresh_vault_tables()
+
+    def refresh_vault_tables(self) -> None:
+        query = self.vault_search_input.text().strip().lower() if hasattr(self, "vault_search_input") else ""
+        entries = [entry for entry in self.credentials if not query or query in entry.searchable_text()]
+        self.visible_credentials = entries
+        if hasattr(self, "vault_table"):
+            self.populate_table(self.vault_table, entries, empty_text="No credentials match this search.")
+            if entries:
+                self.vault_table.selectRow(0)
+                self.update_detail(entries[0])
+            else:
+                self.update_detail(None)
+
+    def populate_table(self, table: QTableWidget, entries: list[CredentialEntry], empty_text: str) -> None:
+        table.clearSpans()
+        table.setRowCount(0)
+        if not entries:
+            table.setRowCount(1)
+            table.setSpan(0, 0, 1, 4)
+            item = QTableWidgetItem(empty_text)
+            item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(0, 0, item)
+            return
+
+        table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            values = [entry.service, entry.account, entry.folder, entry.health]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column in (4, 5):
+                    item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(row, column, item)
+
+    def on_vault_selection_changed(self) -> None:
+        if not hasattr(self, "vault_table"):
+            return
+        selected = self.vault_table.selectionModel().selectedRows()
+        if not selected:
+            return
+        row = selected[0].row()
+        if 0 <= row < len(self.visible_credentials):
+            self.update_detail(self.visible_credentials[row])
+
+    def selected_entry(self) -> CredentialEntry | None:
+        selected = self.vault_table.selectionModel().selectedRows() if hasattr(self, "vault_table") else []
+        if not selected:
+            return None
+        row = selected[0].row()
+        if 0 <= row < len(self.visible_credentials):
+            return self.visible_credentials[row]
+        return None
+
+    def update_detail(self, entry: CredentialEntry | None) -> None:
+        if entry is None:
+            self.detail_service.setText("No credential selected")
+            self.detail_account.setText("Choose a row in the table.")
+            self.detail_url.setText("")
+            self.detail_username.setText("")
+            self.detail_password.setText("")
+            self.detail_notes.setText("")
+            return
+        self.detail_service.setText(entry.service)
+        self.detail_account.setText(f"{entry.account} - {entry.folder} / {entry.entry_type}")
+        self.detail_url.setText(f"URL: {entry.url or 'Not set'}")
+        self.detail_username.setText(f"User: {entry.username or 'Not set'}")
+        self.detail_password.setText(f"Password: {entry.masked_password}")
+        self.detail_notes.setText(entry.notes or "No notes stored for this entry.")
+
+    def copy_selected_value(self, field: str) -> None:
+        entry = self.selected_entry()
+        if entry is None:
+            self.set_session_message("Select a credential first.")
+            return
+        value = entry.username if field == "username" else entry.password
+        QApplication.clipboard().setText(value)
+        label = "username" if field == "username" else "password"
+        self.set_session_message(f"Copied {label} for {entry.service}. Clipboard auto-clear is planned.")
+        QTimer.singleShot(30000, lambda copied=value: self.clear_clipboard_if_unchanged(copied))
+
+    def clear_clipboard_if_unchanged(self, copied: str) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard.text() == copied:
+            clipboard.clear()
+            self.set_session_message("Clipboard cleared.")
+
+    def generate_entry_password(self) -> None:
+        generated = f"rat-{secrets.token_urlsafe(16)}"
+        self.entry_password_field.setText(generated)
+        self.set_session_message("Generated a strong session password.")
+
+    def save_entry(self) -> None:
+        service = self.service_field.text().strip()
+        account = self.account_field.text().strip()
+        password = self.entry_password_field.text()
+        if not service or not account or not password:
+            self.set_session_message("Service, account, and password are required.")
+            return
+
+        entry = CredentialEntry(
+            service=service,
+            account=account,
+            username=self.username_field.text().strip(),
+            password=password,
+            url=self.url_field.text().strip(),
+            folder=self.folder_combo.currentText(),
+            entry_type=self.type_combo.currentText(),
+            notes=self.notes_field.toPlainText().strip(),
+            health=self.calculate_health(password),
+            updated=datetime.now().strftime("%b %d"),
+        )
+        self.credentials.insert(0, entry)
+        self.clear_entry_form()
+        self.refresh_all()
+        self.show_vault()
+        self.set_session_message(f"Added {entry.service} to the session vault.")
+
+    def clear_entry_form(self) -> None:
+        for field in [self.service_field, self.account_field, self.username_field, self.entry_password_field, self.url_field]:
+            field.clear()
+        self.folder_combo.setCurrentIndex(0)
+        self.type_combo.setCurrentIndex(0)
+        self.notes_field.clear()
+
+    def calculate_health(self, password: str) -> str:
+        if len(password) >= 16:
+            return "Strong"
+        if len(password) >= 10:
+            return "Good"
+        return "Weak"
 
     def set_session_message(self, message: str) -> None:
         if hasattr(self, "session_status"):
@@ -1027,6 +1505,68 @@ class PortalWindow(QWidget):
                 background: rgba(255, 63, 145, 58);
                 color: white;
             }}
+            QComboBox#comboField {{
+                min-height: 42px;
+                border-radius: 7px;
+                padding: 0 12px;
+                background: rgba(13, 15, 20, 226);
+                border: 1px solid rgba(255, 255, 255, 34);
+                color: {TEXT};
+                font-size: 13px;
+            }}
+            QComboBox#comboField:hover,
+            QComboBox#comboField:focus {{
+                border-color: rgba(255, 63, 145, 145);
+            }}
+            QComboBox#comboField::drop-down {{
+                border: none;
+                width: 28px;
+            }}
+            QComboBox#comboField QAbstractItemView {{
+                background: rgba(13, 15, 20, 245);
+                border: 1px solid rgba(255, 63, 145, 110);
+                color: {TEXT};
+                selection-background-color: rgba(255, 63, 145, 85);
+            }}
+            QTextEdit#notesField {{
+                border-radius: 7px;
+                padding: 10px 12px;
+                background: rgba(13, 15, 20, 226);
+                border: 1px solid rgba(255, 255, 255, 34);
+                color: {TEXT};
+                font-size: 13px;
+                selection-background-color: rgba(255, 63, 145, 110);
+            }}
+            QTextEdit#notesField:focus {{
+                border-color: rgba(255, 63, 145, 150);
+            }}
+            QLabel#detailTitle {{
+                color: {TEXT};
+                font-size: 22px;
+                font-weight: 820;
+            }}
+            QLabel#detailSubtle {{
+                color: rgba(255, 106, 169, 178);
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QLabel#detailLine {{
+                color: rgba(218, 221, 230, 185);
+                background: rgba(255, 255, 255, 12);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: 5px;
+                padding: 8px 10px;
+                font-size: 12px;
+            }}
+            QLabel#detailNote {{
+                color: rgba(218, 221, 230, 170);
+                background: rgba(255, 255, 255, 10);
+                border: 1px solid rgba(255, 255, 255, 18);
+                border-left: 2px solid rgba(255, 63, 145, 126);
+                border-radius: 5px;
+                padding: 10px;
+                font-size: 12px;
+            }}
             QHeaderView::section {{
                 background: rgba(17, 19, 25, 230);
                 color: rgba(218, 221, 230, 170);
@@ -1130,6 +1670,23 @@ class PortalWindow(QWidget):
                 background: rgba(17, 19, 25, 238);
             }}
             QLineEdit#field::placeholder {{
+                color: rgba(157, 161, 173, 150);
+            }}
+            QLineEdit#formField {{
+                min-height: 38px;
+                border-radius: 7px;
+                padding: 0 14px;
+                background: rgba(13, 15, 20, 226);
+                border: 1px solid rgba(255, 255, 255, 34);
+                color: {TEXT};
+                font-size: 14px;
+                selection-background-color: rgba(255, 63, 145, 120);
+            }}
+            QLineEdit#formField:focus {{
+                border: 1px solid rgba(255, 63, 145, 172);
+                background: rgba(17, 19, 25, 238);
+            }}
+            QLineEdit#formField::placeholder {{
                 color: rgba(157, 161, 173, 150);
             }}
             QPushButton#ghostButton {{

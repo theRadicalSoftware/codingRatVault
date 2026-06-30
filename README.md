@@ -19,6 +19,8 @@ This is an early UI foundation, not a production password manager yet.
 - Dummy account for local UI testing.
 - Dashboard navigation, vault overview, empty-state table, quick actions, and
   security posture panels.
+- Dedicated Vault view with searchable session credentials and a detail pane.
+- Add Entry workflow that creates in-memory session credentials.
 - No real encrypted vault persistence yet.
 - No real user credentials are stored by this prototype.
 
@@ -70,6 +72,16 @@ assets/
 requirements.txt
 run.sh
 ```
+
+## Prototype Workflow
+
+1. Log in with the dummy account.
+2. Click `Vault` in the sidebar to browse demo credentials.
+3. Click `Add Entry` or `Add Credential` to open the credential form.
+4. Save an entry to add it to the current in-memory session.
+5. Search or select rows in the Vault view to inspect details.
+
+Entries created in this prototype are not written to disk yet.
 
 ## Public Repo Safety
 
