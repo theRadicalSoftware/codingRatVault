@@ -316,7 +316,10 @@ class FolderMapWidget(QFrame):
         if not self.node_buttons:
             return
 
-        node_w = max(118, min(142, self.width() - 24))
+        wide_layout = self.width() >= 260
+        max_node_w = 168 if wide_layout else 142
+        available_w = (self.width() - 72) // 2 if wide_layout else self.width() - 24
+        node_w = max(118, min(max_node_w, available_w))
         node_h = 44
         center_x = max(14, (self.width() - node_w) // 2)
         root = self.node_buttons.get("All")
@@ -325,13 +328,25 @@ class FolderMapWidget(QFrame):
             root.resize(node_w, node_h)
 
         children = [name for name, _count in self.folders if name != "All"]
-        y = 82
-        for name in children:
-            button = self.node_buttons.get(name)
-            if button:
-                button.move(center_x, y)
+        if wide_layout:
+            left_x = max(18, (self.width() - (node_w * 2 + 34)) // 2)
+            right_x = left_x + node_w + 34
+            for index, name in enumerate(children):
+                button = self.node_buttons.get(name)
+                if not button:
+                    continue
+                row = index // 2
+                x = center_x if index == len(children) - 1 and len(children) % 2 else (left_x if index % 2 == 0 else right_x)
+                button.move(x, 92 + row * 78)
                 button.resize(node_w, node_h)
-            y += 54
+        else:
+            y = 82
+            for name in children:
+                button = self.node_buttons.get(name)
+                if button:
+                    button.move(center_x, y)
+                    button.resize(node_w, node_h)
+                y += 54
 
     def node_center(self, name: str) -> QPointF | None:
         button = self.node_buttons.get(name)
@@ -382,6 +397,7 @@ class DashboardWidget(QWidget):
         self.nav_buttons: dict[str, NavButton] = {}
         self.folder_chip_buttons: dict[str, QPushButton] = {}
         self.active_folder = "All"
+        self.selected_credential: CredentialEntry | None = None
         self.visible_credentials: list[CredentialEntry] = []
         self.build_ui()
         self.refresh_all()
@@ -398,9 +414,11 @@ class DashboardWidget(QWidget):
         self.content_stack.setContentsMargins(0, 0, 0, 0)
         self.overview_view = self.build_overview_view()
         self.vault_view = self.build_vault_view()
+        self.detail_view = self.build_detail_view()
         self.add_entry_view = self.build_add_entry_view()
         self.content_stack.addWidget(self.overview_view)
         self.content_stack.addWidget(self.vault_view)
+        self.content_stack.addWidget(self.detail_view)
         self.content_stack.addWidget(self.add_entry_view)
         root.addWidget(self.content_host, 1)
 
@@ -474,7 +492,7 @@ class DashboardWidget(QWidget):
         divider.setFixedHeight(1)
         layout.addWidget(divider)
 
-        for index, label in enumerate(["Overview", "Vault", "Generator", "Security", "Settings"]):
+        for index, label in enumerate(["Overview", "Vault", "Details", "Generator", "Security", "Settings"]):
             button = NavButton(label)
             button.clicked.connect(lambda _checked=False, name=label: self.handle_nav(name))
             self.nav_buttons[label] = button
@@ -671,7 +689,7 @@ class DashboardWidget(QWidget):
         eyebrow.setObjectName("eyebrow")
         title = QLabel("Vault")
         title.setObjectName("dashboardTitle")
-        subtitle = QLabel("Browse, filter, inspect, and copy credentials from the current unlocked session.")
+        subtitle = QLabel("Browse, filter, and route credentials from the current unlocked session.")
         subtitle.setObjectName("dashboardSubtitle")
         subtitle.setWordWrap(True)
         title_stack.addWidget(eyebrow)
@@ -713,21 +731,56 @@ class DashboardWidget(QWidget):
         self.vault_table = self.create_credentials_table()
         self.vault_table.setMinimumHeight(430)
         self.vault_table.itemSelectionChanged.connect(self.on_vault_selection_changed)
-        body.addWidget(self.vault_table, 7)
+        self.vault_table.cellDoubleClicked.connect(lambda _row, _column: self.show_detail())
+        body.addWidget(self.vault_table, 5)
 
         map_panel = SectionPanel("Folders", "Jump by workspace lane.")
-        map_panel.setMinimumWidth(172)
+        map_panel.setMinimumWidth(420)
         self.folder_map = FolderMapWidget()
         self.folder_map.folder_selected.connect(self.set_folder_filter)
         map_panel.layout.addWidget(self.folder_map, 1)
-        body.addWidget(map_panel, 2)
+        body.addWidget(map_panel, 5)
+
+        layout.addLayout(body, 1)
+        return view
+
+    def build_detail_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("SELECTED RECORD")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Credential Detail")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Inspect the selected account surface from the current vault session.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+
+        back_button = QPushButton("Back to Vault")
+        back_button.setObjectName("secondaryButton")
+        back_button.setCursor(Qt.PointingHandCursor)
+        back_button.clicked.connect(self.show_vault)
+        header.addWidget(back_button)
+        layout.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
 
         details = SectionPanel("Credential Detail", "Selected account surface.")
-        details.setMinimumWidth(292)
         self.detail_service = QLabel("No credential selected")
         self.detail_service.setObjectName("detailTitle")
         self.detail_service.setWordWrap(True)
-        self.detail_account = QLabel("Choose a row in the table.")
+        self.detail_account = QLabel("Awaiting selected vault record.")
         self.detail_account.setObjectName("detailSubtle")
         self.detail_url = QLabel("")
         self.detail_url.setObjectName("detailLine")
@@ -752,8 +805,15 @@ class DashboardWidget(QWidget):
         details.layout.addWidget(self.detail_username)
         details.layout.addWidget(self.detail_password)
         details.layout.addWidget(self.detail_notes)
+        details.layout.addStretch(1)
+        body.addWidget(details, 3)
 
-        copy_row = QHBoxLayout()
+        actions = SectionPanel("Record Actions", "Session controls.")
+        self.detail_context = QLabel("No active record")
+        self.detail_context.setObjectName("detailNote")
+        self.detail_context.setWordWrap(True)
+        actions.layout.addWidget(self.detail_context)
+
         copy_user = QPushButton("Copy User")
         copy_user.setObjectName("secondaryButton")
         copy_user.setCursor(Qt.PointingHandCursor)
@@ -762,11 +822,24 @@ class DashboardWidget(QWidget):
         copy_pass.setObjectName("secondaryButton")
         copy_pass.setCursor(Qt.PointingHandCursor)
         copy_pass.clicked.connect(lambda: self.copy_selected_value("password"))
+        copy_row = QHBoxLayout()
         copy_row.addWidget(copy_user)
         copy_row.addWidget(copy_pass)
-        details.layout.addLayout(copy_row)
-        details.layout.addStretch(1)
-        body.addWidget(details, 4)
+        actions.layout.addLayout(copy_row)
+
+        add_button = QPushButton("Add Credential")
+        add_button.setObjectName("primarySmallButton")
+        add_button.setCursor(Qt.PointingHandCursor)
+        add_button.clicked.connect(self.show_add_entry)
+        actions.layout.addWidget(add_button)
+
+        vault_button = QPushButton("Open Vault")
+        vault_button.setObjectName("secondaryButton")
+        vault_button.setCursor(Qt.PointingHandCursor)
+        vault_button.clicked.connect(self.show_vault)
+        actions.layout.addWidget(vault_button)
+        actions.layout.addStretch(1)
+        body.addWidget(actions, 2)
 
         layout.addLayout(body, 1)
         return view
@@ -900,6 +973,8 @@ class DashboardWidget(QWidget):
             self.show_overview()
         elif name == "Vault":
             self.show_vault()
+        elif name == "Details":
+            self.show_detail()
         else:
             self.activate_nav(name)
             self.set_session_message(f"{name} workspace is planned for the next product slice.")
@@ -918,6 +993,17 @@ class DashboardWidget(QWidget):
         self.content_stack.setCurrentWidget(self.vault_view)
         self.refresh_vault_tables()
         self.set_session_message("Vault view ready.")
+
+    def show_detail(self) -> None:
+        self.activate_nav("Details")
+        self.content_stack.setCurrentWidget(self.detail_view)
+        entry = self.selected_entry()
+        if entry is not None:
+            self.update_detail(entry)
+            self.set_session_message(f"Inspecting {entry.service}.")
+        else:
+            self.update_detail(None)
+            self.set_session_message("No credential selected.")
 
     def show_add_entry(self) -> None:
         self.activate_nav("Vault")
@@ -1013,6 +1099,8 @@ class DashboardWidget(QWidget):
             self.update_detail(self.visible_credentials[row])
 
     def selected_entry(self) -> CredentialEntry | None:
+        if self.selected_credential is not None:
+            return self.selected_credential
         selected = self.vault_table.selectionModel().selectedRows() if hasattr(self, "vault_table") else []
         if not selected:
             return None
@@ -1022,13 +1110,16 @@ class DashboardWidget(QWidget):
         return None
 
     def update_detail(self, entry: CredentialEntry | None) -> None:
+        self.selected_credential = entry
         if entry is None:
             self.detail_service.setText("No credential selected")
-            self.detail_account.setText("Choose a row in the table.")
+            self.detail_account.setText("Awaiting selected vault record.")
             self.detail_url.setText("")
             self.detail_username.setText("")
             self.detail_password.setText("")
             self.detail_notes.setText("")
+            if hasattr(self, "detail_context"):
+                self.detail_context.setText("No active record")
             return
         self.detail_service.setText(entry.service)
         self.detail_account.setText(f"{entry.account} - {entry.folder} / {entry.entry_type}")
@@ -1036,6 +1127,8 @@ class DashboardWidget(QWidget):
         self.detail_username.setText(f"User: {entry.username or 'Not set'}")
         self.detail_password.setText(f"Password: {entry.masked_password}")
         self.detail_notes.setText(entry.notes or "No notes stored for this entry.")
+        if hasattr(self, "detail_context"):
+            self.detail_context.setText(f"{entry.service}\n{entry.folder} / {entry.health}\nUpdated {entry.updated}")
 
     def copy_selected_value(self, field: str) -> None:
         entry = self.selected_entry()
