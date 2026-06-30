@@ -20,6 +20,7 @@ This is an early UI foundation, not a production password manager yet.
 - Dashboard navigation, vault overview, empty-state table, quick actions, and
   security posture panels.
 - Dedicated Vault view with searchable session credentials and a detail pane.
+- Folder tree navigation for jumping between vault lanes.
 - Add Entry workflow that creates in-memory session credentials.
 - No real encrypted vault persistence yet.
 - No real user credentials are stored by this prototype.
@@ -77,9 +78,10 @@ run.sh
 
 1. Log in with the dummy account.
 2. Click `Vault` in the sidebar to browse demo credentials.
-3. Click `Add Entry` or `Add Credential` to open the credential form.
-4. Save an entry to add it to the current in-memory session.
-5. Search or select rows in the Vault view to inspect details.
+3. Use the folder chips or folder tree to jump between vault lanes.
+4. Click `Add Entry` or `Add Credential` to open the credential form.
+5. Save an entry to add it to the current in-memory session.
+6. Search or select rows in the Vault view to inspect details.
 
 Entries created in this prototype are not written to disk yet.
 

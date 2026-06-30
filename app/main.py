@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer
+from PyQt5.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -263,12 +263,125 @@ class SectionPanel(QFrame):
         self.layout.addLayout(header)
 
 
+class FolderMapWidget(QFrame):
+    folder_selected = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("folderMap")
+        self.setMinimumWidth(132)
+        self.folders: list[tuple[str, int]] = []
+        self.active_folder = "All"
+        self.node_buttons: dict[str, QPushButton] = {}
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_folders(self, folders: list[tuple[str, int]], active_folder: str) -> None:
+        self.folders = folders
+        self.active_folder = active_folder if active_folder else "All"
+        self.rebuild_nodes()
+
+    def rebuild_nodes(self) -> None:
+        for button in self.node_buttons.values():
+            button.deleteLater()
+        self.node_buttons.clear()
+
+        for folder, count in self.folders:
+            button = QPushButton(f"{folder}\n{count} item{'s' if count != 1 else ''}", self)
+            button.setObjectName("folderNodeButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(f"Show {folder.lower()} credentials" if folder != "All" else "Show all credentials")
+            button.clicked.connect(lambda _checked=False, name=folder: self.choose_folder(name))
+            self.node_buttons[folder] = button
+
+        self.position_nodes()
+        self.update_active_styles()
+        self.update()
+
+    def choose_folder(self, folder: str) -> None:
+        self.active_folder = folder
+        self.update_active_styles()
+        self.folder_selected.emit(folder)
+        self.update()
+
+    def update_active_styles(self) -> None:
+        for folder, button in self.node_buttons.items():
+            button.setChecked(folder == self.active_folder)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.position_nodes()
+
+    def position_nodes(self) -> None:
+        if not self.node_buttons:
+            return
+
+        node_w = max(118, min(142, self.width() - 24))
+        node_h = 44
+        center_x = max(14, (self.width() - node_w) // 2)
+        root = self.node_buttons.get("All")
+        if root:
+            root.move(center_x, 12)
+            root.resize(node_w, node_h)
+
+        children = [name for name, _count in self.folders if name != "All"]
+        y = 82
+        for name in children:
+            button = self.node_buttons.get(name)
+            if button:
+                button.move(center_x, y)
+                button.resize(node_w, node_h)
+            y += 54
+
+    def node_center(self, name: str) -> QPointF | None:
+        button = self.node_buttons.get(name)
+        if not button:
+            return None
+        geo = button.geometry()
+        return QPointF(geo.center())
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if "All" not in self.node_buttons:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor(255, 63, 145, 72), 1.2))
+
+        root = self.node_center("All")
+        if root is None:
+            return
+
+        children = [(folder, self.node_center(folder)) for folder, _count in self.folders if folder != "All"]
+        children = [(folder, center) for folder, center in children if center is not None]
+        if not children:
+            return
+
+        trunk_x = max(16, root.x() - 26)
+        painter.drawLine(int(root.x()), int(root.y() + 22), int(trunk_x), int(root.y() + 22))
+        painter.drawLine(int(trunk_x), int(root.y() + 22), int(trunk_x), int(children[-1][1].y()))
+
+        for folder, child in children:
+            if folder == "All":
+                continue
+            if child is None:
+                continue
+            path = QPainterPath()
+            path.moveTo(trunk_x, child.y())
+            path.lineTo(child.x() - 20, child.y())
+            path.quadTo(child.x() - 10, child.y(), child.x(), child.y())
+            painter.drawPath(path)
+
+
 class DashboardWidget(QWidget):
     def __init__(self, on_lock):
         super().__init__()
         self.on_lock = on_lock
         self.credentials = self.seed_credentials()
         self.nav_buttons: dict[str, NavButton] = {}
+        self.folder_chip_buttons: dict[str, QPushButton] = {}
+        self.active_folder = "All"
         self.visible_credentials: list[CredentialEntry] = []
         self.build_ui()
         self.refresh_all()
@@ -297,7 +410,7 @@ class DashboardWidget(QWidget):
                 service="GitHub Workspace",
                 account="theRadicalSoftware",
                 username="rat@vault.local",
-                password="demo-github-token-2026",
+                password="demo-github-pass-2026",
                 url="https://github.com/theRadicalSoftware",
                 folder="Development",
                 entry_type="Login",
@@ -582,11 +695,13 @@ class DashboardWidget(QWidget):
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
-        for label in ["All", "Favorites", "Development", "Infrastructure", "Creative"]:
+        for label in ["All", "Development", "Infrastructure", "Creative", "Personal", "Finance"]:
             button = QPushButton(label)
             button.setObjectName("chipButton")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, folder=label: self.set_folder_filter(folder))
+            self.folder_chip_buttons[label] = button
             if label == "All":
                 button.setChecked(True)
             filter_row.addWidget(button)
@@ -598,11 +713,20 @@ class DashboardWidget(QWidget):
         self.vault_table = self.create_credentials_table()
         self.vault_table.setMinimumHeight(430)
         self.vault_table.itemSelectionChanged.connect(self.on_vault_selection_changed)
-        body.addWidget(self.vault_table, 3)
+        body.addWidget(self.vault_table, 7)
 
-        details = SectionPanel("Credential Detail", "Select a credential to inspect the stored account surface.")
+        map_panel = SectionPanel("Folders", "Jump by workspace lane.")
+        map_panel.setMinimumWidth(172)
+        self.folder_map = FolderMapWidget()
+        self.folder_map.folder_selected.connect(self.set_folder_filter)
+        map_panel.layout.addWidget(self.folder_map, 1)
+        body.addWidget(map_panel, 2)
+
+        details = SectionPanel("Credential Detail", "Selected account surface.")
+        details.setMinimumWidth(292)
         self.detail_service = QLabel("No credential selected")
         self.detail_service.setObjectName("detailTitle")
+        self.detail_service.setWordWrap(True)
         self.detail_account = QLabel("Choose a row in the table.")
         self.detail_account.setObjectName("detailSubtle")
         self.detail_url = QLabel("")
@@ -613,7 +737,14 @@ class DashboardWidget(QWidget):
         self.detail_password.setObjectName("detailLine")
         self.detail_notes = QLabel("")
         self.detail_notes.setObjectName("detailNote")
-        self.detail_notes.setWordWrap(True)
+        for detail_label in [
+            self.detail_account,
+            self.detail_url,
+            self.detail_username,
+            self.detail_password,
+            self.detail_notes,
+        ]:
+            detail_label.setWordWrap(True)
 
         details.layout.addWidget(self.detail_service)
         details.layout.addWidget(self.detail_account)
@@ -634,7 +765,8 @@ class DashboardWidget(QWidget):
         copy_row.addWidget(copy_user)
         copy_row.addWidget(copy_pass)
         details.layout.addLayout(copy_row)
-        body.addWidget(details, 2)
+        details.layout.addStretch(1)
+        body.addWidget(details, 4)
 
         layout.addLayout(body, 1)
         return view
@@ -798,6 +930,28 @@ class DashboardWidget(QWidget):
         self.vault_search_input.setText(query)
         self.show_vault()
 
+    def folder_counts(self) -> list[tuple[str, int]]:
+        folder_order = ["Development", "Infrastructure", "Creative", "Personal", "Finance"]
+        counts = {folder: 0 for folder in folder_order}
+        for entry in self.credentials:
+            counts[entry.folder] = counts.get(entry.folder, 0) + 1
+        total = len(self.credentials)
+        return [("All", total)] + [(folder, counts.get(folder, 0)) for folder in folder_order]
+
+    def set_folder_filter(self, folder: str) -> None:
+        self.active_folder = folder or "All"
+        self.sync_folder_controls()
+        self.refresh_vault_tables()
+        self.set_session_message(f"Showing {self.active_folder if self.active_folder != 'All' else 'all folders'}.")
+
+    def sync_folder_controls(self) -> None:
+        for name, button in self.folder_chip_buttons.items():
+            button.setChecked(name == self.active_folder)
+        if hasattr(self, "folder_map"):
+            self.folder_map.active_folder = self.active_folder
+            self.folder_map.update_active_styles()
+            self.folder_map.update()
+
     def refresh_all(self) -> None:
         folders = sorted({entry.folder for entry in self.credentials})
         weak_count = len([entry for entry in self.credentials if entry.health == "Weak"])
@@ -806,11 +960,18 @@ class DashboardWidget(QWidget):
         self.security_stat.update_values("Ready" if weak_count == 0 else "Review", f"{weak_count} weak entries")
         self.storage_stat.update_values("Memory", "Persistence comes next")
         self.populate_table(self.overview_table, self.credentials[:5], empty_text="No entries yet. Add your first credential.")
+        if hasattr(self, "folder_map"):
+            self.folder_map.set_folders(self.folder_counts(), self.active_folder)
+        self.sync_folder_controls()
         self.refresh_vault_tables()
 
     def refresh_vault_tables(self) -> None:
         query = self.vault_search_input.text().strip().lower() if hasattr(self, "vault_search_input") else ""
-        entries = [entry for entry in self.credentials if not query or query in entry.searchable_text()]
+        entries = [
+            entry for entry in self.credentials
+            if (self.active_folder == "All" or entry.folder == self.active_folder)
+            and (not query or query in entry.searchable_text())
+        ]
         self.visible_credentials = entries
         if hasattr(self, "vault_table"):
             self.populate_table(self.vault_table, entries, empty_text="No credentials match this search.")
@@ -920,6 +1081,9 @@ class DashboardWidget(QWidget):
         )
         self.credentials.insert(0, entry)
         self.clear_entry_form()
+        self.active_folder = entry.folder
+        if hasattr(self, "vault_search_input"):
+            self.vault_search_input.clear()
         self.refresh_all()
         self.show_vault()
         self.set_session_message(f"Added {entry.service} to the session vault.")
@@ -1474,6 +1638,30 @@ class PortalWindow(QWidget):
             QLabel#sectionSubtitle {{
                 color: rgba(157, 161, 173, 180);
                 font-size: 12px;
+            }}
+            QFrame#folderMap {{
+                background: rgba(5, 6, 9, 86);
+                border: 1px solid rgba(255, 255, 255, 18);
+                border-radius: 7px;
+            }}
+            QPushButton#folderNodeButton {{
+                background: rgba(14, 16, 22, 220);
+                border: 1px solid rgba(255, 255, 255, 32);
+                border-radius: 8px;
+                color: rgba(241, 243, 248, 188);
+                font-size: 10px;
+                font-weight: 760;
+                padding: 4px 6px;
+            }}
+            QPushButton#folderNodeButton:hover {{
+                background: rgba(30, 33, 42, 226);
+                border-color: rgba(255, 63, 145, 128);
+                color: white;
+            }}
+            QPushButton#folderNodeButton:checked {{
+                background: rgba(255, 63, 145, 56);
+                border-color: rgba(255, 63, 145, 176);
+                color: white;
             }}
             QPushButton#chipButton {{
                 min-height: 28px;
