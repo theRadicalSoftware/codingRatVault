@@ -1,0 +1,39 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+*.spec
+
+# Local runtime data
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+vaults/
+data/
+backups/
+exports/
+*.cvbak
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+id_rsa
+id_ed25519
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
