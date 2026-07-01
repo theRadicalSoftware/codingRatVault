@@ -1,42 +1,80 @@
 # Coding Rat Vault
 
-Coding Rat Vault is the start of a new local-first password manager built around
-Rory's Coding Rat / Rat Mode identity: dark, focused, technical, and cleanly
-usable. The current build is a PyQt5 desktop prototype with the login portal and
-post-login dashboard shell in place.
+Coding Rat Vault is a local-first desktop password manager built around Rory's
+Coding Rat / Rat Mode identity: dark, focused, technical, and cleanly usable.
+The current build is a PyQt5 application with a real encrypted SQLite vault,
+modular backend services, and Rat Mode visual direction.
 
 The repository is public. Do not commit real vault databases, exported backups,
 environment files, private keys, API tokens, certificates, or personal secrets.
 
 ## Current Status
 
-This is an early UI foundation, not a production password manager yet.
+This is now a functional encrypted-vault foundation, not just a UI prototype.
 
-- Branded PyQt5 login portal.
-- Post-login dashboard shell.
-- Local Coding Rat visual assets.
-- Unlock and create-vault modes.
-- Dummy account for local UI testing.
-- Dashboard navigation, vault overview, empty-state table, quick actions, and
-  security posture panels.
-- Dedicated Vault view with searchable session credentials and a full-width
-  folder tree map for jumping between vault lanes.
-- Separate Details tab for inspecting and copying the selected credential.
-- Add Entry workflow that creates in-memory session credentials.
-- No real encrypted vault persistence yet.
-- No real user credentials are stored by this prototype.
+- Branded PyQt5 login portal and unlocked dashboard.
+- Create/unlock flow for a local encrypted vault.
+- SQLite-backed encrypted storage outside the public repo by default.
+- AES-256-GCM with PBKDF2-SHA256 key derivation.
+- Versioned ciphertext envelopes with authenticated data per field.
+- Encrypted service, account, username, password, URL, notes, and custom fields.
+- Folder and entry-type tables based on the Kitty Cyber Vault feature set.
+- Add/edit/delete workflows that persist encrypted records.
+- Custom-field editor UI with encrypted key-value fields.
+- Folder manager with add, rename, and delete flows.
+- Searchable vault list, folder map, credential detail view, and copy actions.
+- Secure clipboard helper that clears copied values after 30 seconds if unchanged.
+- Password generator screen.
+- Security posture screen with activity log and async HIBP k-anonymity breach checks.
+- Password health dashboard for weak, reused, and incomplete records.
+- Settings screen with import, export, restore, folder, travel, preferences, and
+  self-destruct controls.
+- Encrypted Rat `.ratvault` exports with passphrase confirmation.
+- Backup restore UI that replaces local records from a selected backup.
+- Travel Mode with full encrypted backup creation, travel-safe record retention,
+  and backup restore.
+- Preferences for auto-lock, clipboard clear timing, and username masking.
+- Optional failed-unlock self-destruct controls plus manual typed confirmation.
+- Import support for Rat `.ratvault` and `.rattravel`, CSV, JSON, folders of
+  supported files, and Kitty V1 `.cvbak` files when the old backup passphrase is
+  provided.
 
-## Dummy Account
+## Local Vault Storage
 
-Use the `Fill Demo` button on the login screen, or enter:
+By default, runtime data is stored outside this repository:
+
+```text
+~/.local/share/coding-rat-vault/rat-mode.vault.sqlite3
+```
+
+Environment overrides:
+
+```bash
+RAT_VAULT_DB_PATH=/path/to/vault.sqlite3
+RAT_VAULT_HOME=/path/to/private/runtime-dir
+```
+
+The `.gitignore` also blocks local database, vault, backup, export, key,
+certificate, log, and environment files if runtime data is ever placed under the
+repo during development.
+
+## Demo Account
+
+Use `Fill Demo`, or enter:
 
 ```text
 Access ID: rat@vault.local
 Passphrase: ratmode-demo-2026
 ```
 
-This credential is intentionally public demo data. It only unlocks the local UI
-prototype and does not protect or expose any real vault contents.
+The demo account opens an isolated demo database at:
+
+```text
+~/.local/share/coding-rat-vault/rat-mode-demo.vault.sqlite3
+```
+
+These credentials are public dummy data for UI and workflow testing. They do not
+unlock the private default vault.
 
 ## Run
 
@@ -54,8 +92,6 @@ python3 -m app.main
 
 ## Install Dependencies
 
-The app currently depends on PyQt5.
-
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -67,7 +103,20 @@ pip install -r requirements.txt
 
 ```text
 app/
-  main.py                 PyQt5 app, login portal, dashboard shell
+  main.py                         PyQt5 shell and Rat Mode UI composition
+  core/
+    crypto.py                     PBKDF2 + AES-GCM vault crypto
+    database.py                   SQLite schema and encrypted CRUD
+    import_export.py              Rat/CSV/JSON/Kitty import and export helpers
+    models.py                     Shared credential models
+    paths.py                      Private runtime path handling
+    security/
+      breach.py                   HIBP k-anonymity password checks
+  gui/
+    controllers/
+      vault_controller.py         App-facing vault session controller
+    widgets/
+      clipboard.py                Secure clipboard helper
 assets/
   coding-rat-reference.png
   coding-rat-wallpaper.png
@@ -75,27 +124,20 @@ requirements.txt
 run.sh
 ```
 
-## Prototype Workflow
+## Workflow
 
-1. Log in with the dummy account.
-2. Click `Vault` in the sidebar to browse demo credentials.
-3. Use the folder chips or folder tree to jump between vault lanes.
-4. Click `Add Entry` or `Add Credential` to open the credential form.
-5. Save an entry to add it to the current in-memory session.
-6. Select a row, then click `Details` in the sidebar or double-click the row to
-   inspect and copy the credential.
+1. Launch the app.
+2. Select `Create`.
+3. Choose an access ID and master passphrase.
+4. Add credentials from the Vault or Overview screens.
+5. Use Settings to import, restore, export encrypted backups, configure Travel
+   Mode, and tune local security preferences.
+6. Lock the vault when finished.
 
-Entries created in this prototype are not written to disk yet.
+For a quick UI pass, click `Fill Demo` on the login screen and unlock the
+isolated demo vault.
 
 ## Public Repo Safety
-
-The `.gitignore` is set up to keep local runtime data out of source control:
-
-- SQLite databases and vault files.
-- `.env` files.
-- private keys and certificates.
-- logs, exports, backups, and generated build folders.
-- virtual environments and Python caches.
 
 Before committing future work, run:
 
@@ -106,23 +148,11 @@ rg -n --hidden -S "(PRIVATE KEY|AWS_SECRET|AKIA|github_pat_|ghp_|sk-|token|secre
 
 ## Product Direction
 
-The target product is a calm, polished, local-first desktop vault:
+The next build slices should keep Rat Mode's restrained interface while deepening
+the password-manager surface:
 
-- Master password setup and verification.
-- SQLite-backed encrypted vault.
-- Strong key derivation and authenticated encryption.
-- Password generator.
-- Searchable credential list.
-- Folders or workspaces.
-- Secure clipboard handling.
-- Import/export with encrypted backups.
-- Security health checks.
-- Optional breach checks.
-- Clear lock/unlock and session state.
-
-## Design Direction
-
-Coding Rat Vault should feel more restrained and mature than a novelty cyberpunk
-tool. The brand language is black, graphite, wet asphalt, and controlled hot
-magenta accents. The interface should prioritize clarity, density, and repeated
-daily use over decorative clutter.
+- Master password rotation with full re-encryption tests.
+- Auto-lock based on global input events.
+- Optional migration assistant for previous Kitty vault databases.
+- Per-entry breach and rotation history.
+- Tray and single-instance behavior.
