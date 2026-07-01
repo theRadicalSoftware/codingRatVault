@@ -1,28 +1,35 @@
 from __future__ import annotations
 
 import secrets
+import string
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
@@ -31,9 +38,15 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from app.core.models import CredentialEntry
+from app.core.paths import default_export_dir, demo_vault_db_path
+from app.core.security.breach import BreachMonitor
+from app.gui.controllers.vault_controller import VaultController
+from app.gui.widgets.clipboard import SecureClipboard
+
 
 APP_NAME = "Coding Rat Vault"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 DEMO_ACCESS_ID = "rat@vault.local"
 DEMO_PASSPHRASE = "ratmode-demo-2026"
 MAGENTA = "#ff3f91"
@@ -43,37 +56,6 @@ CHARCOAL = "#101217"
 GRAPHITE = "#1b1e24"
 MUTED = "#9da1ad"
 TEXT = "#f1f3f8"
-
-
-@dataclass
-class CredentialEntry:
-    service: str
-    account: str
-    username: str
-    password: str
-    url: str
-    folder: str
-    entry_type: str
-    notes: str
-    health: str = "Strong"
-    updated: str = "Today"
-    favorite: bool = False
-
-    @property
-    def masked_password(self) -> str:
-        return "*" * max(10, min(len(self.password), 18))
-
-    def searchable_text(self) -> str:
-        return " ".join([
-            self.service,
-            self.account,
-            self.username,
-            self.url,
-            self.folder,
-            self.entry_type,
-            self.notes,
-            self.health,
-        ]).lower()
 
 
 def project_root() -> Path:
@@ -389,17 +371,83 @@ class FolderMapWidget(QFrame):
             painter.drawPath(path)
 
 
+class BreachCheckWorker(QThread):
+    progress_update = pyqtSignal(int, int)
+    check_complete = pyqtSignal(str)
+
+    def __init__(self, entries: list[CredentialEntry]):
+        super().__init__()
+        self.entries = entries
+
+    def run(self) -> None:
+        if not self.entries:
+            self.check_complete.emit("No credentials to check")
+            return
+
+        monitor = BreachMonitor()
+        checked = 0
+        compromised: list[str] = []
+        errors = 0
+        total = len(self.entries)
+
+        for index, entry in enumerate(self.entries, start=1):
+            result = monitor.check_password(entry.password)
+            if result.checked:
+                checked += 1
+                if result.count:
+                    compromised.append(entry.service)
+            else:
+                errors += 1
+            self.progress_update.emit(index, total)
+
+        if compromised:
+            names = ", ".join(compromised[:4])
+            extra = f" and {len(compromised) - 4} more" if len(compromised) > 4 else ""
+            self.check_complete.emit(f"{len(compromised)} exposed password{'s' if len(compromised) != 1 else ''}: {names}{extra}")
+        elif checked:
+            suffix = f"; {errors} unavailable" if errors else ""
+            self.check_complete.emit(f"{checked} passwords clear{suffix}")
+        else:
+            self.check_complete.emit("Breach service unavailable")
+
+
 class DashboardWidget(QWidget):
-    def __init__(self, on_lock):
+    def __init__(self, on_lock, controller: VaultController):
         super().__init__()
         self.on_lock = on_lock
-        self.credentials = self.seed_credentials()
+        self.controller = controller
+        self.auto_lock_minutes = self.controller.setting_int("auto_lock_minutes", 10)
+        self.clipboard_clear_seconds = self.controller.setting_int("clipboard_clear_seconds", 30)
+        self.mask_usernames = self.controller.setting_bool("mask_usernames", False)
+        self.clipboard = SecureClipboard(self.clipboard_clear_seconds * 1000)
+        self.credentials = self.load_credentials()
         self.nav_buttons: dict[str, NavButton] = {}
         self.folder_chip_buttons: dict[str, QPushButton] = {}
         self.active_folder = "All"
         self.selected_credential: CredentialEntry | None = None
         self.visible_credentials: list[CredentialEntry] = []
+        self.editing_entry_id: int | None = None
+        self.breach_worker: BreachCheckWorker | None = None
         self.build_ui()
+        self.refresh_all()
+        self.auto_lock_timer = QTimer(self)
+        self.auto_lock_timer.timeout.connect(self.handle_auto_lock)
+        self.restart_auto_lock_timer()
+
+    def load_credentials(self) -> list[CredentialEntry]:
+        if self.controller.unlocked:
+            return self.controller.list_entries()
+        return []
+
+    def set_controller(self, controller: VaultController) -> None:
+        self.controller = controller
+        self.auto_lock_minutes = self.controller.setting_int("auto_lock_minutes", 10)
+        self.clipboard_clear_seconds = self.controller.setting_int("clipboard_clear_seconds", 30)
+        self.mask_usernames = self.controller.setting_bool("mask_usernames", False)
+        self.clipboard.clear_after_ms = self.clipboard_clear_seconds * 1000
+        self.active_folder = "All"
+        self.selected_credential = None
+        self.credentials = self.load_credentials()
         self.refresh_all()
 
     def build_ui(self) -> None:
@@ -416,52 +464,17 @@ class DashboardWidget(QWidget):
         self.vault_view = self.build_vault_view()
         self.detail_view = self.build_detail_view()
         self.add_entry_view = self.build_add_entry_view()
+        self.generator_view = self.build_generator_view()
+        self.security_view = self.build_security_view()
+        self.settings_view = self.build_settings_view()
         self.content_stack.addWidget(self.overview_view)
         self.content_stack.addWidget(self.vault_view)
         self.content_stack.addWidget(self.detail_view)
         self.content_stack.addWidget(self.add_entry_view)
+        self.content_stack.addWidget(self.generator_view)
+        self.content_stack.addWidget(self.security_view)
+        self.content_stack.addWidget(self.settings_view)
         root.addWidget(self.content_host, 1)
-
-    def seed_credentials(self) -> list[CredentialEntry]:
-        return [
-            CredentialEntry(
-                service="GitHub Workspace",
-                account="theRadicalSoftware",
-                username="rat@vault.local",
-                password="demo-github-pass-2026",
-                url="https://github.com/theRadicalSoftware",
-                folder="Development",
-                entry_type="Login",
-                notes="Public demo credential for the UI prototype.",
-                health="Strong",
-                updated="Today",
-                favorite=True,
-            ),
-            CredentialEntry(
-                service="Deploy Console",
-                account="Rat Mode Sandbox",
-                username="deploy@rat.local",
-                password="sandbox-deploy-pass-2026",
-                url="https://deploy.example.local",
-                folder="Infrastructure",
-                entry_type="Server",
-                notes="Demo server record. No production system is connected.",
-                health="Strong",
-                updated="Today",
-            ),
-            CredentialEntry(
-                service="Design Vault",
-                account="Brand Assets",
-                username="design@rat.local",
-                password="brand-demo-pass",
-                url="https://assets.example.local",
-                folder="Creative",
-                entry_type="Secure Note",
-                notes="Placeholder for brand asset access details.",
-                health="Good",
-                updated="Yesterday",
-            ),
-        ]
 
     def build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -509,7 +522,7 @@ class DashboardWidget(QWidget):
         session_layout.setSpacing(6)
         session_label = QLabel("LOCAL SESSION")
         session_label.setObjectName("metricLabel")
-        session_state = QLabel("Sealed in memory")
+        session_state = QLabel("Encrypted locally")
         session_state.setObjectName("sessionState")
         session_note = QLabel("Vault data stays on this machine.")
         session_note.setObjectName("sessionNote")
@@ -569,7 +582,7 @@ class DashboardWidget(QWidget):
         self.entries_stat = StatCard("Entries", "0", "Ready for the first credential")
         self.folders_stat = StatCard("Folders", "0", "Folders will map to vault lanes")
         self.security_stat = StatCard("Security", "Ready", "Baseline checks are staged")
-        self.storage_stat = StatCard("Storage", "Local", "Session memory only")
+        self.storage_stat = StatCard("Storage", "SQLite", "Encrypted at rest")
         cards = [self.entries_stat, self.folders_stat, self.security_stat, self.storage_stat]
         for index, card in enumerate(cards):
             stats.addWidget(card, 0, index)
@@ -622,7 +635,9 @@ class DashboardWidget(QWidget):
         actions = [
             ("New Login", "Open editor"),
             ("Generate", "Create password"),
-            ("Import", "Bring records in"),
+            ("Import File", "Bring records in"),
+            ("Import Folder", "Scan directory"),
+            ("Export", "Encrypted backup"),
             ("Audit", "Run checks"),
         ]
         for index, (label, detail) in enumerate(actions):
@@ -631,8 +646,16 @@ class DashboardWidget(QWidget):
             button.setCursor(Qt.PointingHandCursor)
             if label == "New Login":
                 button.clicked.connect(self.show_add_entry)
+            elif label == "Generate":
+                button.clicked.connect(self.show_generator)
+            elif label == "Import File":
+                button.clicked.connect(self.import_entries_from_file)
+            elif label == "Import Folder":
+                button.clicked.connect(self.import_entries_from_folder)
+            elif label == "Export":
+                button.clicked.connect(self.export_entries)
             elif label == "Audit":
-                button.clicked.connect(lambda: self.set_session_message("Audit will inspect stored entries once persistence is connected."))
+                button.clicked.connect(self.run_breach_check)
             else:
                 button.clicked.connect(lambda _checked=False, text=label: self.set_session_message(f"{text} flow comes next."))
             grid.addWidget(button, index // 2, index % 2)
@@ -642,10 +665,10 @@ class DashboardWidget(QWidget):
     def build_security_panel(self) -> QWidget:
         panel = SectionPanel("Security Posture")
         rows = [
-            ("Master key", "Accepted for this session"),
-            ("Clipboard", "Auto-clear planned"),
-            ("Breach checks", "Waiting for vault data"),
-            ("Travel mode", "Requires real backup first"),
+            ("Master key", "Verified locally"),
+            ("Clipboard", "30s auto-clear"),
+            ("Breach checks", "Ready"),
+            ("Backups", "Encrypted export"),
         ]
         for label, value in rows:
             row = QHBoxLayout()
@@ -711,20 +734,10 @@ class DashboardWidget(QWidget):
         header.addWidget(add_button)
         layout.addLayout(header)
 
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(8)
-        for label in ["All", "Development", "Infrastructure", "Creative", "Personal", "Finance"]:
-            button = QPushButton(label)
-            button.setObjectName("chipButton")
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, folder=label: self.set_folder_filter(folder))
-            self.folder_chip_buttons[label] = button
-            if label == "All":
-                button.setChecked(True)
-            filter_row.addWidget(button)
-        filter_row.addStretch(1)
-        layout.addLayout(filter_row)
+        self.folder_filter_row = QHBoxLayout()
+        self.folder_filter_row.setSpacing(8)
+        self.rebuild_folder_filter_controls()
+        layout.addLayout(self.folder_filter_row)
 
         body = QHBoxLayout()
         body.setSpacing(16)
@@ -788,6 +801,8 @@ class DashboardWidget(QWidget):
         self.detail_username.setObjectName("detailLine")
         self.detail_password = QLabel("")
         self.detail_password.setObjectName("detailLine")
+        self.detail_custom_fields = QLabel("")
+        self.detail_custom_fields.setObjectName("detailLine")
         self.detail_notes = QLabel("")
         self.detail_notes.setObjectName("detailNote")
         for detail_label in [
@@ -795,6 +810,7 @@ class DashboardWidget(QWidget):
             self.detail_url,
             self.detail_username,
             self.detail_password,
+            self.detail_custom_fields,
             self.detail_notes,
         ]:
             detail_label.setWordWrap(True)
@@ -804,6 +820,7 @@ class DashboardWidget(QWidget):
         details.layout.addWidget(self.detail_url)
         details.layout.addWidget(self.detail_username)
         details.layout.addWidget(self.detail_password)
+        details.layout.addWidget(self.detail_custom_fields)
         details.layout.addWidget(self.detail_notes)
         details.layout.addStretch(1)
         body.addWidget(details, 3)
@@ -826,6 +843,19 @@ class DashboardWidget(QWidget):
         copy_row.addWidget(copy_user)
         copy_row.addWidget(copy_pass)
         actions.layout.addLayout(copy_row)
+
+        edit_row = QHBoxLayout()
+        edit_button = QPushButton("Edit")
+        edit_button.setObjectName("secondaryButton")
+        edit_button.setCursor(Qt.PointingHandCursor)
+        edit_button.clicked.connect(self.edit_selected_entry)
+        delete_button = QPushButton("Delete")
+        delete_button.setObjectName("dangerButton")
+        delete_button.setCursor(Qt.PointingHandCursor)
+        delete_button.clicked.connect(self.delete_selected_entry)
+        edit_row.addWidget(edit_button)
+        edit_row.addWidget(delete_button)
+        actions.layout.addLayout(edit_row)
 
         add_button = QPushButton("Add Credential")
         add_button.setObjectName("primarySmallButton")
@@ -854,23 +884,23 @@ class DashboardWidget(QWidget):
         header.setSpacing(12)
         title_stack = QVBoxLayout()
         title_stack.setSpacing(2)
-        eyebrow = QLabel("NEW CREDENTIAL")
-        eyebrow.setObjectName("eyebrow")
-        title = QLabel("Add Entry")
-        title.setObjectName("dashboardTitle")
-        subtitle = QLabel("Capture the account details now; encryption and persistence will attach in the next backend slice.")
-        subtitle.setObjectName("dashboardSubtitle")
-        subtitle.setWordWrap(True)
-        title_stack.addWidget(eyebrow)
-        title_stack.addWidget(title)
-        title_stack.addWidget(subtitle)
+        self.entry_editor_eyebrow = QLabel("NEW CREDENTIAL")
+        self.entry_editor_eyebrow.setObjectName("eyebrow")
+        self.entry_editor_title = QLabel("Add Entry")
+        self.entry_editor_title.setObjectName("dashboardTitle")
+        self.entry_editor_subtitle = QLabel("Capture account details into the encrypted local vault.")
+        self.entry_editor_subtitle.setObjectName("dashboardSubtitle")
+        self.entry_editor_subtitle.setWordWrap(True)
+        title_stack.addWidget(self.entry_editor_eyebrow)
+        title_stack.addWidget(self.entry_editor_title)
+        title_stack.addWidget(self.entry_editor_subtitle)
         header.addLayout(title_stack, 1)
 
-        cancel_button = QPushButton("Back to Vault")
-        cancel_button.setObjectName("secondaryButton")
-        cancel_button.setCursor(Qt.PointingHandCursor)
-        cancel_button.clicked.connect(self.show_vault)
-        header.addWidget(cancel_button)
+        self.entry_editor_cancel_button = QPushButton("Back to Vault")
+        self.entry_editor_cancel_button.setObjectName("secondaryButton")
+        self.entry_editor_cancel_button.setCursor(Qt.PointingHandCursor)
+        self.entry_editor_cancel_button.clicked.connect(self.cancel_entry_edit)
+        header.addWidget(self.entry_editor_cancel_button)
         layout.addLayout(header)
 
         body = QHBoxLayout()
@@ -900,10 +930,13 @@ class DashboardWidget(QWidget):
         self.url_field.setPlaceholderText("https://")
         self.folder_combo = QComboBox()
         self.folder_combo.setObjectName("comboField")
-        self.folder_combo.addItems(["Development", "Infrastructure", "Creative", "Personal", "Finance"])
+        self.folder_combo.addItems(self.available_folders())
         self.type_combo = QComboBox()
         self.type_combo.setObjectName("comboField")
-        self.type_combo.addItems(["Login", "API Key", "Server", "Database", "Secure Note"])
+        self.type_combo.addItems(self.available_entry_types())
+        self.travel_safe_checkbox = QCheckBox("Travel safe")
+        self.travel_safe_checkbox.setObjectName("checkField")
+        self.travel_safe_checkbox.setToolTip("Keep this record available when Travel Mode removes sensitive entries.")
         self.notes_field = QTextEdit()
         self.notes_field.setObjectName("notesField")
         self.notes_field.setPlaceholderText("Short context, recovery notes, or rotation details")
@@ -916,21 +949,51 @@ class DashboardWidget(QWidget):
         form.addRow("URL", self.url_field)
         form.addRow("Folder", self.folder_combo)
         form.addRow("Type", self.type_combo)
+        form.addRow("Travel", self.travel_safe_checkbox)
         form.addRow("Notes", self.notes_field)
         form_panel.layout.addLayout(form)
+
+        custom_header = QHBoxLayout()
+        custom_label = QLabel("Custom Fields")
+        custom_label.setObjectName("sectionSubtitle")
+        custom_header.addWidget(custom_label)
+        custom_header.addStretch(1)
+        add_custom_button = QPushButton("Add Field")
+        add_custom_button.setObjectName("secondaryButton")
+        add_custom_button.setCursor(Qt.PointingHandCursor)
+        add_custom_button.clicked.connect(self.add_custom_field_row)
+        remove_custom_button = QPushButton("Remove Field")
+        remove_custom_button.setObjectName("secondaryButton")
+        remove_custom_button.setCursor(Qt.PointingHandCursor)
+        remove_custom_button.clicked.connect(self.remove_selected_custom_field)
+        custom_header.addWidget(add_custom_button)
+        custom_header.addWidget(remove_custom_button)
+        form_panel.layout.addLayout(custom_header)
+
+        self.custom_fields_table = QTableWidget(0, 2)
+        self.custom_fields_table.setObjectName("vaultTable")
+        self.custom_fields_table.setHorizontalHeaderLabels(["Name", "Value"])
+        self.custom_fields_table.verticalHeader().setVisible(False)
+        self.custom_fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.custom_fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.custom_fields_table.setMinimumHeight(120)
+        self.custom_fields_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.custom_fields_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.custom_fields_table.setAlternatingRowColors(True)
+        form_panel.layout.addWidget(self.custom_fields_table)
 
         action_row = QHBoxLayout()
         generate_button = QPushButton("Generate")
         generate_button.setObjectName("secondaryButton")
         generate_button.setCursor(Qt.PointingHandCursor)
         generate_button.clicked.connect(self.generate_entry_password)
-        save_button = QPushButton("Save Entry")
-        save_button.setObjectName("primarySmallButton")
-        save_button.setCursor(Qt.PointingHandCursor)
-        save_button.clicked.connect(self.save_entry)
+        self.save_entry_button = QPushButton("Save Entry")
+        self.save_entry_button.setObjectName("primarySmallButton")
+        self.save_entry_button.setCursor(Qt.PointingHandCursor)
+        self.save_entry_button.clicked.connect(self.save_entry)
         action_row.addWidget(generate_button)
         action_row.addStretch(1)
-        action_row.addWidget(save_button)
+        action_row.addWidget(self.save_entry_button)
         form_panel.layout.addLayout(action_row)
         body.addWidget(form_panel, 3)
 
@@ -938,8 +1001,8 @@ class DashboardWidget(QWidget):
         for text in [
             "Use names that are easy to scan later.",
             "Keep recovery hints in notes, not full recovery codes.",
-            "Folder and type choices will become real filters in the persistent vault.",
-            "This prototype stores entries in memory for the current session only.",
+            "Folders and types are real encrypted-vault filters.",
+            "Notes and custom fields are encrypted before they touch the database.",
         ]:
             label = QLabel(text)
             label.setObjectName("activityLine")
@@ -947,6 +1010,365 @@ class DashboardWidget(QWidget):
             guidance.layout.addWidget(label)
         guidance.layout.addStretch(1)
         body.addWidget(guidance, 2)
+        layout.addLayout(body, 1)
+        return view
+
+    def build_generator_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("PASSWORD GENERATOR")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Generator")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Create strong passwords for new or rotated vault records.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+        layout.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        generator_panel = SectionPanel("Generated Secret", "Built with Python's secrets module.")
+        self.generated_password_field = QLineEdit()
+        self.generated_password_field.setObjectName("formField")
+        self.generated_password_field.setReadOnly(True)
+        self.generated_password_field.setPlaceholderText("Generate a password")
+        generator_panel.layout.addWidget(self.generated_password_field)
+
+        controls = QHBoxLayout()
+        generate_button = QPushButton("Generate")
+        generate_button.setObjectName("primarySmallButton")
+        generate_button.setCursor(Qt.PointingHandCursor)
+        generate_button.clicked.connect(self.generate_standalone_password)
+        copy_button = QPushButton("Copy")
+        copy_button.setObjectName("secondaryButton")
+        copy_button.setCursor(Qt.PointingHandCursor)
+        copy_button.clicked.connect(self.copy_generated_password)
+        use_button = QPushButton("Use In Entry")
+        use_button.setObjectName("secondaryButton")
+        use_button.setCursor(Qt.PointingHandCursor)
+        use_button.clicked.connect(self.use_generated_password)
+        controls.addWidget(generate_button)
+        controls.addWidget(copy_button)
+        controls.addWidget(use_button)
+        controls.addStretch(1)
+        generator_panel.layout.addLayout(controls)
+        body.addWidget(generator_panel, 3)
+
+        policy_panel = SectionPanel("Generator Policy")
+        for text in [
+            "Length: 24 characters",
+            "Alphabet: letters, numbers, and symbols",
+            "Clipboard: clears after 30 seconds when unchanged",
+            "Storage: encrypted only after saving to the vault",
+        ]:
+            label = QLabel(text)
+            label.setObjectName("activityLine")
+            label.setWordWrap(True)
+            policy_panel.layout.addWidget(label)
+        policy_panel.layout.addStretch(1)
+        body.addWidget(policy_panel, 2)
+        layout.addLayout(body, 1)
+        return view
+
+    def build_security_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("SECURITY")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Posture")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Encryption, clipboard, activity, and breach checks for the unlocked local vault.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+        breach_button = QPushButton("Run Breach Check")
+        breach_button.setObjectName("primarySmallButton")
+        breach_button.setCursor(Qt.PointingHandCursor)
+        breach_button.clicked.connect(self.run_breach_check)
+        header.addWidget(breach_button)
+        layout.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        posture = SectionPanel("Controls")
+        self.security_rows: dict[str, QLabel] = {}
+        for label, value in [
+            ("Cipher", "AES-256-GCM"),
+            ("Key derivation", "PBKDF2-SHA256 / 600k"),
+            ("Encrypted fields", "service, account, user, password, URL, notes, custom fields"),
+            ("Clipboard", "Auto-clear after 30 seconds"),
+            ("Auto-lock", "10 minutes"),
+            ("Travel mode", "Inactive"),
+            ("Breach checks", "Ready"),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            label_widget = QLabel(label)
+            label_widget.setObjectName("securityLabel")
+            value_widget = QLabel(value)
+            value_widget.setObjectName("securityValue")
+            value_widget.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value_widget.setWordWrap(True)
+            self.security_rows[label] = value_widget
+            row.addWidget(label_widget)
+            row.addStretch(1)
+            row.addWidget(value_widget)
+            posture.layout.addLayout(row)
+        posture.layout.addStretch(1)
+        body.addWidget(posture, 3)
+
+        activity = SectionPanel("Recent Activity")
+        self.activity_labels: list[QLabel] = []
+        for _index in range(8):
+            label = QLabel("")
+            label.setObjectName("activityLine")
+            label.setWordWrap(True)
+            self.activity_labels.append(label)
+            activity.layout.addWidget(label)
+        activity.layout.addStretch(1)
+        body.addWidget(activity, 3)
+        layout.addLayout(body, 1)
+
+        health = SectionPanel("Password Health", "Local review of weak, reused, and incomplete records.")
+        health_stats = QHBoxLayout()
+        health_stats.setSpacing(10)
+        self.health_total_label = QLabel("0 entries")
+        self.health_total_label.setObjectName("activityLine")
+        self.health_strong_label = QLabel("0 strong")
+        self.health_strong_label.setObjectName("activityLine")
+        self.health_review_label = QLabel("0 review")
+        self.health_review_label.setObjectName("activityLine")
+        self.health_weak_label = QLabel("0 weak")
+        self.health_weak_label.setObjectName("activityLine")
+        for label in [self.health_total_label, self.health_strong_label, self.health_review_label, self.health_weak_label]:
+            label.setWordWrap(True)
+            health_stats.addWidget(label)
+        health.layout.addLayout(health_stats)
+
+        self.health_table = QTableWidget(0, 4)
+        self.health_table.setObjectName("vaultTable")
+        self.health_table.setHorizontalHeaderLabels(["Service", "Folder", "Status", "Issues"])
+        self.health_table.verticalHeader().setVisible(False)
+        self.health_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.health_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.health_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.health_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.health_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.health_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.health_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.health_table.setMinimumHeight(210)
+        health.layout.addWidget(self.health_table)
+        layout.addWidget(health)
+        return view
+
+    def build_settings_view(self) -> QWidget:
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(2)
+        eyebrow = QLabel("VAULT SETTINGS")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Settings")
+        title.setObjectName("dashboardTitle")
+        subtitle = QLabel("Local storage, imports, exports, and backup maintenance.")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack, 1)
+        layout.addLayout(header)
+
+        body = QGridLayout()
+        body.setHorizontalSpacing(16)
+        body.setVerticalSpacing(16)
+        storage = SectionPanel("Storage")
+        self.database_path_label = QLabel(str(self.controller.db_path))
+        self.database_path_label.setObjectName("detailNote")
+        self.database_path_label.setWordWrap(True)
+        storage.layout.addWidget(self.database_path_label)
+        for text in [
+            "Runtime vault data is stored outside the public repository.",
+            "Repository .gitignore still blocks accidental local vault files, backups, and exports.",
+            "Exports are encrypted with a separate export passphrase.",
+        ]:
+            label = QLabel(text)
+            label.setObjectName("activityLine")
+            label.setWordWrap(True)
+            storage.layout.addWidget(label)
+        storage.layout.addStretch(1)
+        body.addWidget(storage, 0, 0)
+
+        transfer = SectionPanel("Import / Export")
+        import_file = QPushButton("Import File")
+        import_file.setObjectName("secondaryButton")
+        import_file.setCursor(Qt.PointingHandCursor)
+        import_file.clicked.connect(self.import_entries_from_file)
+        import_folder = QPushButton("Import Folder")
+        import_folder.setObjectName("secondaryButton")
+        import_folder.setCursor(Qt.PointingHandCursor)
+        import_folder.clicked.connect(self.import_entries_from_folder)
+        export_button = QPushButton("Export Backup")
+        export_button.setObjectName("primarySmallButton")
+        export_button.setCursor(Qt.PointingHandCursor)
+        export_button.clicked.connect(self.export_entries)
+        restore_button = QPushButton("Restore Backup")
+        restore_button.setObjectName("secondaryButton")
+        restore_button.setCursor(Qt.PointingHandCursor)
+        restore_button.clicked.connect(self.restore_entries)
+        transfer.layout.addWidget(import_file)
+        transfer.layout.addWidget(import_folder)
+        transfer.layout.addWidget(export_button)
+        transfer.layout.addWidget(restore_button)
+        self.transfer_status = QLabel("Supports Rat encrypted exports, CSV, JSON, and Kitty V1 .cvbak with passphrase.")
+        self.transfer_status.setObjectName("detailNote")
+        self.transfer_status.setWordWrap(True)
+        transfer.layout.addWidget(self.transfer_status)
+        transfer.layout.addStretch(1)
+        body.addWidget(transfer, 0, 1)
+
+        folders = SectionPanel("Folders")
+        self.folder_manager_table = QTableWidget(0, 1)
+        self.folder_manager_table.setObjectName("vaultTable")
+        self.folder_manager_table.setHorizontalHeaderLabels(["Folder"])
+        self.folder_manager_table.verticalHeader().setVisible(False)
+        self.folder_manager_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.folder_manager_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.folder_manager_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.folder_manager_table.setMinimumHeight(180)
+        folders.layout.addWidget(self.folder_manager_table)
+
+        folder_actions = QHBoxLayout()
+        add_folder = QPushButton("Add")
+        add_folder.setObjectName("secondaryButton")
+        add_folder.setCursor(Qt.PointingHandCursor)
+        add_folder.clicked.connect(self.add_folder)
+        rename_folder = QPushButton("Rename")
+        rename_folder.setObjectName("secondaryButton")
+        rename_folder.setCursor(Qt.PointingHandCursor)
+        rename_folder.clicked.connect(self.rename_selected_folder)
+        delete_folder = QPushButton("Delete")
+        delete_folder.setObjectName("dangerButton")
+        delete_folder.setCursor(Qt.PointingHandCursor)
+        delete_folder.clicked.connect(self.delete_selected_folder)
+        folder_actions.addWidget(add_folder)
+        folder_actions.addWidget(rename_folder)
+        folder_actions.addWidget(delete_folder)
+        folders.layout.addLayout(folder_actions)
+        self.folder_manager_status = QLabel("Deleting a folder moves its records to Imported.")
+        self.folder_manager_status.setObjectName("detailNote")
+        self.folder_manager_status.setWordWrap(True)
+        folders.layout.addWidget(self.folder_manager_status)
+        folders.layout.addStretch(1)
+        body.addWidget(folders, 0, 2)
+
+        travel = SectionPanel("Travel Mode", "Keep only records marked travel safe after creating an encrypted backup.")
+        self.travel_mode_status = QLabel("Inactive")
+        self.travel_mode_status.setObjectName("detailNote")
+        self.travel_mode_status.setWordWrap(True)
+        travel.layout.addWidget(self.travel_mode_status)
+        travel_actions = QHBoxLayout()
+        activate_travel = QPushButton("Activate")
+        activate_travel.setObjectName("primarySmallButton")
+        activate_travel.setCursor(Qt.PointingHandCursor)
+        activate_travel.clicked.connect(self.activate_travel_mode)
+        restore_travel = QPushButton("Restore")
+        restore_travel.setObjectName("secondaryButton")
+        restore_travel.setCursor(Qt.PointingHandCursor)
+        restore_travel.clicked.connect(self.restore_travel_mode)
+        travel_actions.addWidget(activate_travel)
+        travel_actions.addWidget(restore_travel)
+        travel.layout.addLayout(travel_actions)
+        self.travel_mode_note = QLabel("Mark entries as Travel safe in the credential editor before activating.")
+        self.travel_mode_note.setObjectName("activityLine")
+        self.travel_mode_note.setWordWrap(True)
+        travel.layout.addWidget(self.travel_mode_note)
+        travel.layout.addStretch(1)
+        body.addWidget(travel, 1, 0)
+
+        preferences = SectionPanel("Preferences", "Runtime behavior for the unlocked vault.")
+        pref_form = QFormLayout()
+        self.auto_lock_spin = QSpinBox()
+        self.auto_lock_spin.setObjectName("comboField")
+        self.auto_lock_spin.setRange(0, 120)
+        self.auto_lock_spin.setSuffix(" min")
+        self.clipboard_spin = QSpinBox()
+        self.clipboard_spin.setObjectName("comboField")
+        self.clipboard_spin.setRange(5, 300)
+        self.clipboard_spin.setSuffix(" sec")
+        self.mask_usernames_checkbox = QCheckBox("Mask usernames in detail view")
+        self.mask_usernames_checkbox.setObjectName("checkField")
+        pref_form.addRow("Auto-lock", self.auto_lock_spin)
+        pref_form.addRow("Clipboard", self.clipboard_spin)
+        pref_form.addRow("Privacy", self.mask_usernames_checkbox)
+        preferences.layout.addLayout(pref_form)
+        save_preferences = QPushButton("Save Preferences")
+        save_preferences.setObjectName("primarySmallButton")
+        save_preferences.setCursor(Qt.PointingHandCursor)
+        save_preferences.clicked.connect(self.save_preferences)
+        preferences.layout.addWidget(save_preferences)
+        self.preferences_status = QLabel("")
+        self.preferences_status.setObjectName("detailNote")
+        self.preferences_status.setWordWrap(True)
+        preferences.layout.addWidget(self.preferences_status)
+        preferences.layout.addStretch(1)
+        body.addWidget(preferences, 1, 1)
+
+        destruct = SectionPanel("Self-Destruct", "Optional failed-unlock trigger and manual vault destruction.")
+        destruct_form = QFormLayout()
+        self.self_destruct_checkbox = QCheckBox("Enable failed-unlock self-destruct")
+        self.self_destruct_checkbox.setObjectName("checkField")
+        self.self_destruct_attempts_spin = QSpinBox()
+        self.self_destruct_attempts_spin.setObjectName("comboField")
+        self.self_destruct_attempts_spin.setRange(1, 20)
+        destruct_form.addRow("Trigger", self.self_destruct_checkbox)
+        destruct_form.addRow("Attempts", self.self_destruct_attempts_spin)
+        destruct.layout.addLayout(destruct_form)
+        save_destruct = QPushButton("Save Controls")
+        save_destruct.setObjectName("secondaryButton")
+        save_destruct.setCursor(Qt.PointingHandCursor)
+        save_destruct.clicked.connect(self.save_self_destruct_settings)
+        destroy_now = QPushButton("Destroy Vault")
+        destroy_now.setObjectName("dangerButton")
+        destroy_now.setCursor(Qt.PointingHandCursor)
+        destroy_now.clicked.connect(self.trigger_self_destruct)
+        destruct_actions = QHBoxLayout()
+        destruct_actions.addWidget(save_destruct)
+        destruct_actions.addWidget(destroy_now)
+        destruct.layout.addLayout(destruct_actions)
+        self.self_destruct_status = QLabel("")
+        self.self_destruct_status.setObjectName("detailNote")
+        self.self_destruct_status.setWordWrap(True)
+        destruct.layout.addWidget(self.self_destruct_status)
+        destruct.layout.addStretch(1)
+        body.addWidget(destruct, 1, 2)
+
         layout.addLayout(body, 1)
         return view
 
@@ -975,9 +1397,15 @@ class DashboardWidget(QWidget):
             self.show_vault()
         elif name == "Details":
             self.show_detail()
+        elif name == "Generator":
+            self.show_generator()
+        elif name == "Security":
+            self.show_security()
+        elif name == "Settings":
+            self.show_settings()
         else:
             self.activate_nav(name)
-            self.set_session_message(f"{name} workspace is planned for the next product slice.")
+            self.set_session_message(f"{name} workspace is unavailable.")
 
     def activate_nav(self, name: str) -> None:
         for label, button in self.nav_buttons.items():
@@ -1006,18 +1434,120 @@ class DashboardWidget(QWidget):
             self.set_session_message("No credential selected.")
 
     def show_add_entry(self) -> None:
+        self.prepare_entry_editor()
         self.activate_nav("Vault")
         self.content_stack.setCurrentWidget(self.add_entry_view)
         self.service_field.setFocus()
         self.set_session_message("Add a new credential.")
+
+    def edit_selected_entry(self) -> None:
+        entry = self.selected_entry()
+        if entry is None:
+            self.set_session_message("Select a credential first.")
+            return
+        self.prepare_entry_editor(entry)
+        self.activate_nav("Details")
+        self.content_stack.setCurrentWidget(self.add_entry_view)
+        self.service_field.setFocus()
+        self.set_session_message(f"Editing {entry.service}.")
+
+    def cancel_entry_edit(self) -> None:
+        self.editing_entry_id = None
+        self.clear_entry_form()
+        self.show_vault()
+
+    def prepare_entry_editor(self, entry: CredentialEntry | None = None) -> None:
+        self.refresh_entry_options(entry.folder if entry else None, entry.entry_type if entry else None)
+        self.editing_entry_id = entry.id if entry else None
+
+        if entry is None:
+            self.entry_editor_eyebrow.setText("NEW CREDENTIAL")
+            self.entry_editor_title.setText("Add Entry")
+            self.entry_editor_subtitle.setText("Capture account details into the encrypted local vault.")
+            self.save_entry_button.setText("Save Entry")
+            self.clear_entry_form()
+            return
+
+        self.entry_editor_eyebrow.setText("EDIT CREDENTIAL")
+        self.entry_editor_title.setText("Edit Entry")
+        self.entry_editor_subtitle.setText("Update encrypted record fields and custom metadata.")
+        self.save_entry_button.setText("Update Entry")
+        self.service_field.setText(entry.service)
+        self.account_field.setText(entry.account)
+        self.username_field.setText(entry.username)
+        self.entry_password_field.setText(entry.password)
+        self.url_field.setText(entry.url)
+        self.notes_field.setPlainText(entry.notes)
+        self.folder_combo.setCurrentText(entry.folder)
+        self.type_combo.setCurrentText(entry.entry_type)
+        self.travel_safe_checkbox.setChecked(entry.favorite)
+        self.custom_fields_table.setRowCount(0)
+        for name, value in entry.custom_fields.items():
+            self.add_custom_field_row(name, value)
+
+    def refresh_entry_options(self, selected_folder: str | None = None, selected_type: str | None = None) -> None:
+        if not hasattr(self, "folder_combo"):
+            return
+        selected_folder = selected_folder or self.folder_combo.currentText()
+        selected_type = selected_type or self.type_combo.currentText()
+        self.folder_combo.blockSignals(True)
+        self.type_combo.blockSignals(True)
+        self.folder_combo.clear()
+        self.folder_combo.addItems(self.available_folders())
+        self.type_combo.clear()
+        self.type_combo.addItems(self.available_entry_types())
+        if selected_folder:
+            self.folder_combo.setCurrentText(selected_folder)
+        if selected_type:
+            self.type_combo.setCurrentText(selected_type)
+        self.folder_combo.blockSignals(False)
+        self.type_combo.blockSignals(False)
+
+    def show_generator(self) -> None:
+        self.activate_nav("Generator")
+        self.content_stack.setCurrentWidget(self.generator_view)
+        if not self.generated_password_field.text():
+            self.generate_standalone_password()
+        self.set_session_message("Generator ready.")
+
+    def show_security(self) -> None:
+        self.activate_nav("Security")
+        self.refresh_security_controls()
+        self.refresh_activity()
+        self.refresh_password_health()
+        self.content_stack.setCurrentWidget(self.security_view)
+        self.set_session_message("Security posture ready.")
+
+    def show_settings(self) -> None:
+        self.activate_nav("Settings")
+        self.database_path_label.setText(str(self.controller.db_path))
+        self.refresh_folder_manager()
+        self.refresh_settings_controls()
+        self.refresh_travel_mode_status()
+        self.content_stack.setCurrentWidget(self.settings_view)
+        self.set_session_message("Vault settings ready.")
 
     def search_from_overview(self) -> None:
         query = self.global_search_input.text().strip()
         self.vault_search_input.setText(query)
         self.show_vault()
 
+    def available_folders(self) -> list[str]:
+        folders = self.controller.folders()
+        preferred = ["Development", "Infrastructure", "Creative", "Personal", "Finance", "Imported"]
+        ordered = [folder for folder in preferred if folder in folders]
+        ordered.extend(folder for folder in folders if folder not in ordered)
+        return ordered or preferred
+
+    def available_entry_types(self) -> list[str]:
+        entry_types = self.controller.entry_types()
+        preferred = ["Login", "API Key", "Server", "Database", "SSH Key", "Credit Card", "Secure Note", "AWS Account", "Environment Variables"]
+        ordered = [entry_type for entry_type in preferred if entry_type in entry_types]
+        ordered.extend(entry_type for entry_type in entry_types if entry_type not in ordered)
+        return ordered or preferred
+
     def folder_counts(self) -> list[tuple[str, int]]:
-        folder_order = ["Development", "Infrastructure", "Creative", "Personal", "Finance"]
+        folder_order = self.available_folders()
         counts = {folder: 0 for folder in folder_order}
         for entry in self.credentials:
             counts[entry.folder] = counts.get(entry.folder, 0) + 1
@@ -1038,18 +1568,49 @@ class DashboardWidget(QWidget):
             self.folder_map.update_active_styles()
             self.folder_map.update()
 
+    def rebuild_folder_filter_controls(self) -> None:
+        if not hasattr(self, "folder_filter_row"):
+            return
+        while self.folder_filter_row.count():
+            item = self.folder_filter_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.folder_chip_buttons.clear()
+        for label in ["All", *self.available_folders()]:
+            button = QPushButton(label)
+            button.setObjectName("chipButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, folder=label: self.set_folder_filter(folder))
+            self.folder_chip_buttons[label] = button
+            self.folder_filter_row.addWidget(button)
+        self.folder_filter_row.addStretch(1)
+        self.sync_folder_controls()
+
     def refresh_all(self) -> None:
+        self.credentials = self.load_credentials()
         folders = sorted({entry.folder for entry in self.credentials})
         weak_count = len([entry for entry in self.credentials if entry.health == "Weak"])
-        self.entries_stat.update_values(str(len(self.credentials)), "Stored in this demo session")
+        self.entries_stat.update_values(str(len(self.credentials)), "Encrypted local records")
         self.folders_stat.update_values(str(len(folders)), "Active folder lanes")
         self.security_stat.update_values("Ready" if weak_count == 0 else "Review", f"{weak_count} weak entries")
-        self.storage_stat.update_values("Memory", "Persistence comes next")
+        self.storage_stat.update_values("SQLite", "Encrypted at rest")
         self.populate_table(self.overview_table, self.credentials[:5], empty_text="No entries yet. Add your first credential.")
         if hasattr(self, "folder_map"):
             self.folder_map.set_folders(self.folder_counts(), self.active_folder)
+        if hasattr(self, "folder_filter_row"):
+            self.rebuild_folder_filter_controls()
+        if hasattr(self, "folder_manager_table"):
+            self.refresh_folder_manager()
+        if hasattr(self, "travel_mode_status"):
+            self.refresh_travel_mode_status()
+        if hasattr(self, "folder_combo"):
+            self.refresh_entry_options()
         self.sync_folder_controls()
         self.refresh_vault_tables()
+        self.refresh_activity()
+        self.refresh_password_health()
 
     def refresh_vault_tables(self) -> None:
         query = self.vault_search_input.text().strip().lower() if hasattr(self, "vault_search_input") else ""
@@ -1117,6 +1678,7 @@ class DashboardWidget(QWidget):
             self.detail_url.setText("")
             self.detail_username.setText("")
             self.detail_password.setText("")
+            self.detail_custom_fields.setText("")
             self.detail_notes.setText("")
             if hasattr(self, "detail_context"):
                 self.detail_context.setText("No active record")
@@ -1124,11 +1686,18 @@ class DashboardWidget(QWidget):
         self.detail_service.setText(entry.service)
         self.detail_account.setText(f"{entry.account} - {entry.folder} / {entry.entry_type}")
         self.detail_url.setText(f"URL: {entry.url or 'Not set'}")
-        self.detail_username.setText(f"User: {entry.username or 'Not set'}")
+        username = "******" if self.mask_usernames and entry.username else (entry.username or "Not set")
+        self.detail_username.setText(f"User: {username}")
         self.detail_password.setText(f"Password: {entry.masked_password}")
+        if entry.custom_fields:
+            custom_summary = ", ".join(entry.custom_fields.keys())
+            self.detail_custom_fields.setText(f"Custom fields: {custom_summary}")
+        else:
+            self.detail_custom_fields.setText("Custom fields: None")
         self.detail_notes.setText(entry.notes or "No notes stored for this entry.")
         if hasattr(self, "detail_context"):
-            self.detail_context.setText(f"{entry.service}\n{entry.folder} / {entry.health}\nUpdated {entry.updated}")
+            travel_state = "Travel safe" if entry.favorite else "Sensitive"
+            self.detail_context.setText(f"{entry.service}\n{entry.folder} / {entry.health} / {travel_state}\nUpdated {entry.updated}")
 
     def copy_selected_value(self, field: str) -> None:
         entry = self.selected_entry()
@@ -1136,21 +1705,69 @@ class DashboardWidget(QWidget):
             self.set_session_message("Select a credential first.")
             return
         value = entry.username if field == "username" else entry.password
-        QApplication.clipboard().setText(value)
         label = "username" if field == "username" else "password"
-        self.set_session_message(f"Copied {label} for {entry.service}. Clipboard auto-clear is planned.")
-        QTimer.singleShot(30000, lambda copied=value: self.clear_clipboard_if_unchanged(copied))
-
-    def clear_clipboard_if_unchanged(self, copied: str) -> None:
-        clipboard = QApplication.clipboard()
-        if clipboard.text() == copied:
-            clipboard.clear()
-            self.set_session_message("Clipboard cleared.")
+        self.clipboard.copy(value, on_clear=lambda: self.set_session_message("Clipboard cleared."))
+        self.set_session_message(f"Copied {label} for {entry.service}. Clipboard clears in 30 seconds.")
 
     def generate_entry_password(self) -> None:
-        generated = f"rat-{secrets.token_urlsafe(16)}"
+        generated = self.make_password()
         self.entry_password_field.setText(generated)
-        self.set_session_message("Generated a strong session password.")
+        self.set_session_message("Generated a strong password.")
+
+    def generate_standalone_password(self) -> None:
+        self.generated_password_field.setText(self.make_password())
+        self.set_session_message("Generated a strong password.")
+
+    def copy_generated_password(self) -> None:
+        value = self.generated_password_field.text()
+        if not value:
+            self.generate_standalone_password()
+            value = self.generated_password_field.text()
+        self.clipboard.copy(value, on_clear=lambda: self.set_session_message("Clipboard cleared."))
+        self.set_session_message("Generated password copied. Clipboard clears in 30 seconds.")
+
+    def use_generated_password(self) -> None:
+        value = self.generated_password_field.text()
+        if not value:
+            self.generate_standalone_password()
+            value = self.generated_password_field.text()
+        self.show_add_entry()
+        self.entry_password_field.setText(value)
+
+    def make_password(self, length: int = 24) -> str:
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+[]{}"
+        while True:
+            password = "".join(secrets.choice(alphabet) for _ in range(length))
+            if (
+                any(char.islower() for char in password)
+                and any(char.isupper() for char in password)
+                and any(char.isdigit() for char in password)
+                and any(char in "!@#$%^&*()-_=+[]{}" for char in password)
+            ):
+                return password
+
+    def add_custom_field_row(self, name: str = "", value: str = "") -> None:
+        row = self.custom_fields_table.rowCount()
+        self.custom_fields_table.insertRow(row)
+        self.custom_fields_table.setItem(row, 0, QTableWidgetItem(name))
+        self.custom_fields_table.setItem(row, 1, QTableWidgetItem(value))
+        self.custom_fields_table.selectRow(row)
+
+    def remove_selected_custom_field(self) -> None:
+        selected = self.custom_fields_table.selectionModel().selectedRows()
+        if selected:
+            self.custom_fields_table.removeRow(selected[0].row())
+
+    def custom_fields_from_table(self) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for row in range(self.custom_fields_table.rowCount()):
+            name_item = self.custom_fields_table.item(row, 0)
+            value_item = self.custom_fields_table.item(row, 1)
+            name = name_item.text().strip() if name_item else ""
+            value = value_item.text() if value_item else ""
+            if name:
+                fields[name] = value
+        return fields
 
     def save_entry(self) -> None:
         service = self.service_field.text().strip()
@@ -1171,22 +1788,58 @@ class DashboardWidget(QWidget):
             notes=self.notes_field.toPlainText().strip(),
             health=self.calculate_health(password),
             updated=datetime.now().strftime("%b %d"),
+            id=self.editing_entry_id,
+            custom_fields=self.custom_fields_from_table(),
+            favorite=self.travel_safe_checkbox.isChecked(),
         )
-        self.credentials.insert(0, entry)
+        if self.editing_entry_id is None:
+            self.controller.add_entry(entry)
+            message = f"Added {entry.service} to the encrypted vault."
+        else:
+            self.controller.update_entry(self.editing_entry_id, entry)
+            message = f"Updated {entry.service}."
         self.clear_entry_form()
+        self.editing_entry_id = None
         self.active_folder = entry.folder
         if hasattr(self, "vault_search_input"):
             self.vault_search_input.clear()
         self.refresh_all()
         self.show_vault()
-        self.set_session_message(f"Added {entry.service} to the session vault.")
+        self.set_session_message(message)
+
+    def delete_selected_entry(self) -> None:
+        entry = self.selected_entry()
+        if entry is None or entry.id is None:
+            self.set_session_message("Select a credential first.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete Credential",
+            f"Delete {entry.service}? This removes the encrypted record from this vault.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.controller.delete_entry(entry.id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete Failed", str(exc))
+            return
+        self.selected_credential = None
+        self.refresh_all()
+        self.show_vault()
+        self.set_session_message(f"Deleted {entry.service}.")
 
     def clear_entry_form(self) -> None:
         for field in [self.service_field, self.account_field, self.username_field, self.entry_password_field, self.url_field]:
             field.clear()
         self.folder_combo.setCurrentIndex(0)
         self.type_combo.setCurrentIndex(0)
+        self.travel_safe_checkbox.setChecked(False)
         self.notes_field.clear()
+        if hasattr(self, "custom_fields_table"):
+            self.custom_fields_table.setRowCount(0)
 
     def calculate_health(self, password: str) -> str:
         if len(password) >= 16:
@@ -1195,9 +1848,464 @@ class DashboardWidget(QWidget):
             return "Good"
         return "Weak"
 
+    def refresh_folder_manager(self) -> None:
+        if not hasattr(self, "folder_manager_table"):
+            return
+        folders = self.available_folders()
+        self.folder_manager_table.setRowCount(len(folders))
+        for row, folder in enumerate(folders):
+            self.folder_manager_table.setItem(row, 0, QTableWidgetItem(folder))
+
+    def selected_folder_name(self) -> str | None:
+        selected = self.folder_manager_table.selectionModel().selectedRows() if hasattr(self, "folder_manager_table") else []
+        if not selected:
+            return None
+        item = self.folder_manager_table.item(selected[0].row(), 0)
+        return item.text() if item else None
+
+    def add_folder(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Add Folder", "Folder name")
+        if not accepted:
+            return
+        try:
+            self.controller.add_folder(name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Folder Not Added", str(exc))
+            return
+        self.refresh_all()
+        self.folder_manager_status.setText(f"Added folder {name.strip()}.")
+        self.set_session_message(f"Added folder {name.strip()}.")
+
+    def rename_selected_folder(self) -> None:
+        folder = self.selected_folder_name()
+        if not folder:
+            self.set_session_message("Select a folder first.")
+            return
+        name, accepted = QInputDialog.getText(self, "Rename Folder", "Folder name", text=folder)
+        if not accepted:
+            return
+        try:
+            self.controller.rename_folder(folder, name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Folder Not Renamed", str(exc))
+            return
+        if self.active_folder == folder:
+            self.active_folder = name.strip()
+        self.refresh_all()
+        self.folder_manager_status.setText(f"Renamed {folder} to {name.strip()}.")
+        self.set_session_message(f"Renamed folder {folder}.")
+
+    def delete_selected_folder(self) -> None:
+        folder = self.selected_folder_name()
+        if not folder:
+            self.set_session_message("Select a folder first.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete Folder",
+            f"Delete {folder}? Existing records will move to Imported.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.controller.delete_folder(folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "Folder Not Deleted", str(exc))
+            return
+        if self.active_folder == folder:
+            self.active_folder = "Imported"
+        self.refresh_all()
+        self.folder_manager_status.setText(f"Deleted {folder}; records moved to Imported.")
+        self.set_session_message(f"Deleted folder {folder}.")
+
+    def refresh_settings_controls(self) -> None:
+        if not hasattr(self, "auto_lock_spin"):
+            return
+        self.auto_lock_minutes = self.controller.setting_int("auto_lock_minutes", self.auto_lock_minutes)
+        self.clipboard_clear_seconds = self.controller.setting_int("clipboard_clear_seconds", self.clipboard_clear_seconds)
+        self.mask_usernames = self.controller.setting_bool("mask_usernames", self.mask_usernames)
+        self.auto_lock_spin.setValue(self.auto_lock_minutes)
+        self.clipboard_spin.setValue(self.clipboard_clear_seconds)
+        self.mask_usernames_checkbox.setChecked(self.mask_usernames)
+        self.self_destruct_checkbox.setChecked(self.controller.setting_bool("self_destruct_enabled", False))
+        self.self_destruct_attempts_spin.setValue(self.controller.setting_int("self_destruct_failed_attempts", 5))
+        self.preferences_status.setText(f"Auto-lock {self.auto_lock_minutes} min; clipboard {self.clipboard_clear_seconds} sec.")
+        self.self_destruct_status.setText("Disabled" if not self.self_destruct_checkbox.isChecked() else "Failed-unlock trigger enabled.")
+
+    def save_preferences(self) -> None:
+        self.auto_lock_minutes = self.auto_lock_spin.value()
+        self.clipboard_clear_seconds = self.clipboard_spin.value()
+        self.mask_usernames = self.mask_usernames_checkbox.isChecked()
+        self.controller.set_setting("auto_lock_minutes", self.auto_lock_minutes)
+        self.controller.set_setting("clipboard_clear_seconds", self.clipboard_clear_seconds)
+        self.controller.set_setting("mask_usernames", self.mask_usernames)
+        self.clipboard.clear_after_ms = self.clipboard_clear_seconds * 1000
+        self.restart_auto_lock_timer()
+        self.refresh_security_controls()
+        self.refresh_vault_tables()
+        self.preferences_status.setText("Preferences saved.")
+        self.set_session_message("Preferences saved.")
+
+    def save_self_destruct_settings(self) -> None:
+        enabled = self.self_destruct_checkbox.isChecked()
+        attempts = self.self_destruct_attempts_spin.value()
+        self.controller.set_setting("self_destruct_enabled", enabled)
+        self.controller.set_setting("self_destruct_failed_attempts", attempts)
+        self.self_destruct_status.setText(f"Enabled after {attempts} failed unlock attempts." if enabled else "Disabled.")
+        self.set_session_message("Self-destruct controls saved.")
+
+    def refresh_travel_mode_status(self) -> None:
+        if not hasattr(self, "travel_mode_status"):
+            return
+        active = self.controller.is_travel_mode_active()
+        total = len(self.credentials)
+        safe = len([entry for entry in self.credentials if entry.favorite])
+        removed = self.controller.setting_int("travel_mode_removed_count", 0)
+        if active:
+            backup = self.controller.travel_mode_backup_path() or "No backup path recorded"
+            self.travel_mode_status.setText(f"ACTIVE - {total} records on device, {removed} removed. Backup: {backup}")
+        else:
+            self.travel_mode_status.setText(f"Inactive - {safe}/{total} records marked travel safe.")
+
+    def restore_entries(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Restore Backup",
+            str(default_export_dir()),
+            "Vault Backups (*.ratvault *.rattravel *.cvbak *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        passphrase, accepted = QInputDialog.getText(
+            self,
+            "Restore Passphrase",
+            "Backup passphrase. Leave blank only for plain JSON.",
+            QLineEdit.Password,
+        )
+        if not accepted:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Restore Backup",
+            "Restore will replace the current vault records with the backup contents.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            count = self.controller.restore_path(path, passphrase or None)
+        except Exception as exc:
+            QMessageBox.warning(self, "Restore Failed", str(exc))
+            self.set_session_message("Restore failed.")
+            return
+        self.refresh_all()
+        self.transfer_status.setText(f"Restored {count} entries from {path}.")
+        self.set_session_message(f"Restored {count} entries.")
+
+    def activate_travel_mode(self) -> None:
+        if self.controller.is_travel_mode_active():
+            self.set_session_message("Travel mode is already active.")
+            return
+        default_path = default_export_dir() / f"rat-travel-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.rattravel"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Travel Backup",
+            str(default_path),
+            "Rat Travel Backup (*.rattravel);;Rat Vault Backup (*.ratvault);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.endswith((".rattravel", ".ratvault")):
+            path = f"{path}.rattravel"
+        passphrase = self.request_export_passphrase(
+            title="Travel Backup Passphrase",
+            prompt="Choose and confirm the passphrase for the full travel backup.",
+        )
+        if passphrase is None:
+            return
+        total = len(self.credentials)
+        safe = len([entry for entry in self.credentials if entry.favorite])
+        answer = QMessageBox.warning(
+            self,
+            "Activate Travel Mode",
+            f"This will create an encrypted backup, keep {safe} travel-safe records, and remove {total - safe} records from this device.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            result = self.controller.activate_travel_mode(path, passphrase)
+        except Exception as exc:
+            QMessageBox.warning(self, "Travel Mode Failed", str(exc))
+            return
+        self.refresh_all()
+        self.refresh_travel_mode_status()
+        self.set_session_message(f"Travel mode active. Removed {result['removed']} records.")
+
+    def restore_travel_mode(self) -> None:
+        path = self.controller.travel_mode_backup_path()
+        if not path or not Path(path).exists():
+            selected, _selected_filter = QFileDialog.getOpenFileName(
+                self,
+                "Open Travel Backup",
+                str(default_export_dir()),
+                "Rat Travel Backup (*.rattravel *.ratvault);;All Files (*)",
+            )
+            path = selected
+        if not path:
+            return
+        passphrase, accepted = QInputDialog.getText(
+            self,
+            "Travel Backup Passphrase",
+            "Passphrase for the travel backup.",
+            QLineEdit.Password,
+        )
+        if not accepted:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Restore Travel Backup",
+            "Restore the full vault from the travel backup and disable Travel Mode?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            count = self.controller.deactivate_travel_mode(path, passphrase)
+        except Exception as exc:
+            QMessageBox.warning(self, "Travel Restore Failed", str(exc))
+            return
+        self.refresh_all()
+        self.refresh_travel_mode_status()
+        self.set_session_message(f"Travel mode restored {count} entries.")
+
+    def trigger_self_destruct(self) -> None:
+        answer = QMessageBox.critical(
+            self,
+            "Destroy Vault",
+            "This permanently removes the local encrypted vault database from this machine.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        phrase, accepted = QInputDialog.getText(
+            self,
+            "Final Confirmation",
+            "Type DESTROY RAT VAULT to confirm.",
+        )
+        if not accepted or phrase != "DESTROY RAT VAULT":
+            self.set_session_message("Self-destruct cancelled.")
+            return
+        success, message = self.controller.self_destruct()
+        if success:
+            QMessageBox.information(self, "Vault Destroyed", message)
+            QApplication.instance().quit()
+        else:
+            QMessageBox.warning(self, "Self-Destruct Failed", message)
+
+    def import_entries_from_file(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Import Credentials",
+            str(default_export_dir()),
+            "Vault Imports (*.ratvault *.cvbak *.json *.csv);;All Files (*)",
+        )
+        if path:
+            self.import_entries_from_path(path)
+
+    def import_entries_from_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Import Credential Folder", str(default_export_dir()))
+        if path:
+            self.import_entries_from_path(path)
+
+    def import_entries_from_path(self, path: str) -> None:
+        passphrase, accepted = QInputDialog.getText(
+            self,
+            "Import Passphrase",
+            "Import passphrase for encrypted Rat/Kitty backups. Leave blank for plain CSV or JSON.",
+            QLineEdit.Password,
+        )
+        if not accepted:
+            return
+        try:
+            count = self.controller.import_path(path, passphrase=passphrase or None)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            self.set_session_message("Import failed.")
+            return
+        self.refresh_all()
+        self.transfer_status.setText(f"Imported {count} entries from {path}.")
+        self.set_session_message(f"Imported {count} entries.")
+
+    def export_entries(self) -> None:
+        default_path = default_export_dir() / f"rat-vault-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.ratvault"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Encrypted Backup",
+            str(default_path),
+            "Rat Vault Backup (*.ratvault);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.endswith(".ratvault"):
+            path = f"{path}.ratvault"
+
+        passphrase = self.request_export_passphrase()
+        if passphrase is None:
+            return
+
+        try:
+            count = self.controller.export_path(path, passphrase)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", str(exc))
+            self.set_session_message("Export failed.")
+            return
+        self.transfer_status.setText(f"Exported {count} entries to {path}.")
+        self.refresh_activity()
+        self.set_session_message(f"Exported {count} entries.")
+
+    def request_export_passphrase(
+        self,
+        title: str = "Export Passphrase",
+        prompt: str = "Choose and confirm an export passphrase for this encrypted backup.",
+    ) -> str | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        prompt_label = QLabel(prompt)
+        prompt_label.setWordWrap(True)
+        layout.addWidget(prompt_label)
+
+        form = QFormLayout()
+        passphrase_input = QLineEdit()
+        passphrase_input.setEchoMode(QLineEdit.Password)
+        passphrase_input.setObjectName("formField")
+        confirm_input = QLineEdit()
+        confirm_input.setEchoMode(QLineEdit.Password)
+        confirm_input.setObjectName("formField")
+        form.addRow("Passphrase", passphrase_input)
+        form.addRow("Confirm", confirm_input)
+        layout.addLayout(form)
+
+        status = QLabel("")
+        status.setObjectName("statusLabel")
+        status.setWordWrap(True)
+        layout.addWidget(status)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def validate() -> None:
+            passphrase = passphrase_input.text()
+            confirm = confirm_input.text()
+            if len(passphrase) < 12:
+                status.setText("Use at least 12 characters.")
+                return
+            if passphrase != confirm:
+                status.setText("Passphrases do not match.")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(validate)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        return passphrase_input.text()
+
+    def run_breach_check(self) -> None:
+        if self.breach_worker is not None and self.breach_worker.isRunning():
+            self.set_session_message("Breach check already running.")
+            return
+        entries = self.controller.list_entries()
+        self.breach_worker = BreachCheckWorker(entries)
+        self.breach_worker.progress_update.connect(self.on_breach_progress)
+        self.breach_worker.check_complete.connect(self.on_breach_complete)
+        self.breach_worker.finished.connect(self.on_breach_finished)
+        if hasattr(self, "security_rows"):
+            self.security_rows["Breach checks"].setText("Running...")
+        self.set_session_message("Running breach check in the background.")
+        self.breach_worker.start()
+
+    def on_breach_progress(self, current: int, total: int) -> None:
+        if hasattr(self, "security_rows"):
+            self.security_rows["Breach checks"].setText(f"Checking {current}/{total}")
+        self.set_session_message(f"Breach check {current}/{total}.")
+
+    def on_breach_complete(self, result: str) -> None:
+        if hasattr(self, "security_rows"):
+            self.security_rows["Breach checks"].setText(result)
+        self.set_session_message(result)
+
+    def on_breach_finished(self) -> None:
+        self.breach_worker = None
+        self.refresh_activity()
+
+    def refresh_security_controls(self) -> None:
+        if not hasattr(self, "security_rows"):
+            return
+        self.security_rows["Clipboard"].setText(f"Auto-clear after {self.clipboard_clear_seconds} seconds")
+        self.security_rows["Auto-lock"].setText("Disabled" if self.auto_lock_minutes == 0 else f"{self.auto_lock_minutes} minutes")
+        travel_state = "Active" if self.controller.is_travel_mode_active() else "Inactive"
+        if "Travel mode" in self.security_rows:
+            self.security_rows["Travel mode"].setText(travel_state)
+
+    def refresh_password_health(self) -> None:
+        if not hasattr(self, "health_table") or not self.controller.unlocked:
+            return
+        report = self.controller.password_health_report()
+        self.health_total_label.setText(f"{report['total']} entries")
+        self.health_strong_label.setText(f"{report['strong']} strong")
+        self.health_review_label.setText(f"{report['review']} review")
+        self.health_weak_label.setText(f"{report['weak']} weak")
+
+        rows = report["rows"]
+        self.health_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [row["service"], row["folder"], row["status"], row["issues"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.health_table.setItem(row_index, column, item)
+
+    def refresh_activity(self) -> None:
+        if not hasattr(self, "activity_labels"):
+            return
+        activity = self.controller.recent_activity()
+        for index, label in enumerate(self.activity_labels):
+            if index < len(activity):
+                item = activity[index]
+                label.setText(f"{item['created_at']}  {item['action']}  {item['description']}")
+                label.show()
+            else:
+                label.setText("No additional activity.")
+                label.show()
+
+    def handle_auto_lock(self) -> None:
+        self.auto_lock_timer.stop()
+        if hasattr(self, "session_status"):
+            self.session_status.setText("Auto-lock engaged after inactivity.")
+        self.on_lock()
+
+    def restart_auto_lock_timer(self) -> None:
+        if not hasattr(self, "auto_lock_timer"):
+            return
+        self.auto_lock_timer.stop()
+        if self.auto_lock_minutes > 0:
+            self.auto_lock_timer.start(self.auto_lock_minutes * 60 * 1000)
+
     def set_session_message(self, message: str) -> None:
         if hasattr(self, "session_status"):
             self.session_status.setText(message)
+        self.restart_auto_lock_timer()
 
 
 class PortalWindow(QWidget):
@@ -1206,6 +2314,7 @@ class PortalWindow(QWidget):
         self.drag_position = QPoint()
         self.mode = "unlock"
         self.transient_secret = bytearray()
+        self.controller = VaultController()
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1180, 740)
         self.resize(1280, 780)
@@ -1235,7 +2344,7 @@ class PortalWindow(QWidget):
         self.view_stack = QStackedLayout(self.view_host)
         self.view_stack.setContentsMargins(0, 0, 0, 0)
         self.view_stack.addWidget(self.build_login_view())
-        self.dashboard_view = DashboardWidget(self.lock_to_portal)
+        self.dashboard_view = DashboardWidget(self.lock_to_portal, self.controller)
         self.view_stack.addWidget(self.dashboard_view)
         layout.addWidget(self.view_host, 1)
 
@@ -1363,7 +2472,7 @@ class PortalWindow(QWidget):
         self.demo_button.clicked.connect(self.fill_demo_account)
         aux_row.addWidget(self.demo_button)
         aux_row.addStretch(1)
-        self.mode_hint = QLabel("Vault core pending")
+        self.mode_hint = QLabel("Encrypted local vault")
         self.mode_hint.setObjectName("hint")
         aux_row.addWidget(self.mode_hint)
         panel_layout.addLayout(aux_row)
@@ -1374,7 +2483,7 @@ class PortalWindow(QWidget):
         self.submit_button.clicked.connect(self.submit)
         panel_layout.addWidget(self.submit_button)
 
-        self.status_label = QLabel("Use the demo account to test login")
+        self.status_label = QLabel("Create or unlock the encrypted local vault")
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
         panel_layout.addWidget(self.status_label)
@@ -1414,8 +2523,13 @@ class PortalWindow(QWidget):
         self.confirm_input.setVisible(is_create)
         self.submit_button.setText("Create Vault" if is_create else "Unlock Vault")
         self.access_id_input.setPlaceholderText("New access ID" if is_create else "Access ID")
-        self.mode_hint.setText("New local vault" if is_create else "Demo account enabled")
-        self.status_label.setText("Choose an access ID and master key" if is_create else "Use the demo account to test login")
+        self.mode_hint.setText("New encrypted vault" if is_create else "Encrypted local vault")
+        if is_create:
+            self.status_label.setText("Choose an access ID and master passphrase")
+        elif self.controller.vault_exists():
+            self.status_label.setText("Unlock the local encrypted vault")
+        else:
+            self.status_label.setText("Create a vault first, or use Fill Demo")
         self.access_id_input.setFocus()
 
     def toggle_secret_visibility(self) -> None:
@@ -1430,8 +2544,64 @@ class PortalWindow(QWidget):
         self.unlock_mode_button.setChecked(True)
         self.access_id_input.setText(DEMO_ACCESS_ID)
         self.passphrase_input.setText(DEMO_PASSPHRASE)
-        self.status_label.setText("Demo account loaded")
+        self.status_label.setText("Demo credentials loaded")
         self.passphrase_input.setFocus()
+
+    def is_demo_credentials(self, access_id: str, secret: str) -> bool:
+        return access_id.strip().lower() == DEMO_ACCESS_ID and secret == DEMO_PASSPHRASE
+
+    def unlock_demo_vault(self) -> str:
+        demo_controller = VaultController(demo_vault_db_path())
+        if not demo_controller.vault_exists():
+            demo_controller.create_vault(DEMO_ACCESS_ID, DEMO_PASSPHRASE)
+        else:
+            demo_controller.unlock_vault(DEMO_ACCESS_ID, DEMO_PASSPHRASE)
+        self.seed_demo_entries(demo_controller)
+        self.controller = demo_controller
+        self.dashboard_view.set_controller(self.controller)
+        return f"Demo vault unlocked at {self.controller.db_path}."
+
+    def seed_demo_entries(self, controller: VaultController) -> None:
+        if controller.list_entries():
+            return
+        demo_entries = [
+            CredentialEntry(
+                service="GitHub Workspace",
+                account="theRadicalSoftware",
+                username="rat@vault.local",
+                password="demo-github-pass-2026",
+                url="https://github.com/theRadicalSoftware",
+                folder="Development",
+                entry_type="Login",
+                notes="Public demo credential for UI and workflow testing only.",
+                health="Strong",
+                favorite=True,
+            ),
+            CredentialEntry(
+                service="Deploy Console",
+                account="Rat Mode Sandbox",
+                username="deploy@rat.local",
+                password="sandbox-deploy-pass-2026",
+                url="https://deploy.example.local",
+                folder="Infrastructure",
+                entry_type="Server",
+                notes="Demo server record. No production system is connected.",
+                health="Strong",
+            ),
+            CredentialEntry(
+                service="Design Vault",
+                account="Brand Assets",
+                username="design@rat.local",
+                password="brand-demo-pass",
+                url="https://assets.example.local",
+                folder="Creative",
+                entry_type="Secure Note",
+                notes="Placeholder for brand asset access details.",
+                health="Good",
+            ),
+        ]
+        for entry in demo_entries:
+            controller.add_entry(entry)
 
     def submit(self) -> None:
         self.clear_transient_secret()
@@ -1453,8 +2623,8 @@ class PortalWindow(QWidget):
             return
 
         if self.mode == "create":
-            if len(secret) < 10:
-                self.status_label.setText("Use at least 10 characters")
+            if len(secret) < 12:
+                self.status_label.setText("Use at least 12 characters")
                 self.clear_transient_secret()
                 self.shake_panel()
                 return
@@ -1463,14 +2633,52 @@ class PortalWindow(QWidget):
                 self.clear_transient_secret()
                 self.shake_panel()
                 return
-            message = f"New vault session initialized for {access_id}."
-        else:
-            if access_id.lower() != DEMO_ACCESS_ID or secret != DEMO_PASSPHRASE:
-                self.status_label.setText("Demo account mismatch")
+            try:
+                message = self.controller.create_vault(access_id, secret)
+            except Exception as exc:
+                self.status_label.setText(str(exc))
                 self.clear_transient_secret()
                 self.shake_panel()
                 return
-            message = f"Demo vault unlocked for {access_id}."
+        else:
+            if self.is_demo_credentials(access_id, secret):
+                try:
+                    message = self.unlock_demo_vault()
+                except Exception as exc:
+                    self.status_label.setText(str(exc))
+                    self.clear_transient_secret()
+                    self.shake_panel()
+                    return
+                self.clear_transient_secret()
+                self.access_id_input.clear()
+                self.passphrase_input.clear()
+                self.confirm_input.clear()
+                self.show_dashboard(message)
+                return
+            if not self.controller.vault_exists():
+                self.status_label.setText("No local vault exists yet. Switch to Create.")
+                self.clear_transient_secret()
+                self.shake_panel()
+                return
+            try:
+                message = self.controller.unlock_vault(access_id, secret)
+            except Exception as exc:
+                should_destroy = False
+                try:
+                    should_destroy = self.controller.register_failed_unlock()
+                except Exception:
+                    pass
+                if should_destroy:
+                    success, destroy_message = self.controller.self_destruct()
+                    self.status_label.setText(destroy_message if success else str(exc))
+                    self.clear_transient_secret()
+                    QMessageBox.critical(self, "Vault Destroyed", destroy_message)
+                    QApplication.instance().quit()
+                    return
+                self.status_label.setText(str(exc))
+                self.clear_transient_secret()
+                self.shake_panel()
+                return
 
         self.clear_transient_secret()
         self.access_id_input.clear()
@@ -1480,11 +2688,19 @@ class PortalWindow(QWidget):
 
     def show_dashboard(self, message: str) -> None:
         self.top_status.setText("VAULT DASHBOARD")
+        self.dashboard_view.refresh_all()
+        self.dashboard_view.restart_auto_lock_timer()
         self.view_stack.setCurrentWidget(self.dashboard_view)
         self.dashboard_view.set_session_message(message)
 
     def lock_to_portal(self) -> None:
         self.clear_transient_secret()
+        if self.controller.unlocked:
+            self.controller.lock()
+        self.controller = VaultController()
+        self.dashboard_view.set_controller(self.controller)
+        if hasattr(self.dashboard_view, "auto_lock_timer"):
+            self.dashboard_view.auto_lock_timer.stop()
         self.access_id_input.clear()
         self.passphrase_input.clear()
         self.confirm_input.clear()
@@ -1546,6 +2762,8 @@ class PortalWindow(QWidget):
 
     def closeEvent(self, event) -> None:
         self.clear_transient_secret()
+        if self.controller.unlocked:
+            self.controller.lock()
         self.access_id_input.clear()
         self.passphrase_input.clear()
         self.confirm_input.clear()
@@ -1675,7 +2893,8 @@ class PortalWindow(QWidget):
                 border-color: rgba(255, 63, 145, 150);
             }}
             QPushButton#primarySmallButton,
-            QPushButton#secondaryButton {{
+            QPushButton#secondaryButton,
+            QPushButton#dangerButton {{
                 min-height: 42px;
                 border-radius: 7px;
                 padding: 0 16px;
@@ -1697,6 +2916,16 @@ class PortalWindow(QWidget):
             }}
             QPushButton#secondaryButton:hover {{
                 border-color: rgba(255, 63, 145, 130);
+                color: white;
+            }}
+            QPushButton#dangerButton {{
+                background: rgba(47, 18, 25, 185);
+                border: 1px solid rgba(255, 88, 116, 92);
+                color: rgba(255, 214, 222, 205);
+            }}
+            QPushButton#dangerButton:hover {{
+                background: rgba(94, 24, 41, 210);
+                border-color: rgba(255, 88, 116, 165);
                 color: white;
             }}
             QFrame#statCard {{
@@ -1786,7 +3015,8 @@ class PortalWindow(QWidget):
                 background: rgba(255, 63, 145, 58);
                 color: white;
             }}
-            QComboBox#comboField {{
+            QComboBox#comboField,
+            QSpinBox#comboField {{
                 min-height: 42px;
                 border-radius: 7px;
                 padding: 0 12px;
@@ -1796,8 +3026,32 @@ class PortalWindow(QWidget):
                 font-size: 13px;
             }}
             QComboBox#comboField:hover,
-            QComboBox#comboField:focus {{
+            QComboBox#comboField:focus,
+            QSpinBox#comboField:hover,
+            QSpinBox#comboField:focus {{
                 border-color: rgba(255, 63, 145, 145);
+            }}
+            QSpinBox#comboField::up-button,
+            QSpinBox#comboField::down-button {{
+                background: rgba(20, 22, 29, 170);
+                border: none;
+                width: 18px;
+            }}
+            QCheckBox#checkField {{
+                color: rgba(241, 243, 248, 190);
+                font-size: 13px;
+                spacing: 8px;
+            }}
+            QCheckBox#checkField::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                background: rgba(13, 15, 20, 226);
+                border: 1px solid rgba(255, 255, 255, 48);
+            }}
+            QCheckBox#checkField::indicator:checked {{
+                background: rgba(255, 63, 145, 180);
+                border-color: rgba(255, 145, 190, 210);
             }}
             QComboBox#comboField::drop-down {{
                 border: none;
